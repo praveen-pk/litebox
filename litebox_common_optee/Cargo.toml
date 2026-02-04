@@ -11,7 +11,6 @@ litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 num_enum = { version = "0.7.3", default-features = false }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 zerocopy = { version = "0.8", features = ["derive"] }
-thiserror = { version = "2.0.6", default-features = false }
 
 [lints]
 workspace = true
