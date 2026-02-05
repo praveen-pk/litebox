@@ -450,9 +450,9 @@ const TEE_PARAM_TYPE_NONE: u8 = 0;
 const TEE_PARAM_TYPE_VALUE_INPUT: u8 = 1;
 const TEE_PARAM_TYPE_VALUE_OUTPUT: u8 = 2;
 const TEE_PARAM_TYPE_VALUE_INOUT: u8 = 3;
-const TEE_PARAM_TYPE_MEMREF_INPUT: u8 = 5;
-const TEE_PARAM_TYPE_MEMREF_OUTPUT: u8 = 6;
-const TEE_PARAM_TYPE_MEMREF_INOUT: u8 = 7;
+const TEE_PARAM_TYPE_MEMREF_INPUT: u8 = 4;
+const TEE_PARAM_TYPE_MEMREF_OUTPUT: u8 = 5;
+const TEE_PARAM_TYPE_MEMREF_INOUT: u8 = 6;
 
 #[derive(Clone, Copy, TryFromPrimitive, PartialEq)]
 #[repr(u8)]
@@ -1385,6 +1385,15 @@ pub struct OpteeMsgParam {
     u: OpteeMsgParamUnion,
 }
 
+impl Default for OpteeMsgParam {
+    fn default() -> Self {
+        Self {
+            attr: OpteeMsgAttr::default(),
+            u: OpteeMsgParamUnion { octets: [0u8; 24] },
+        }
+    }
+}
+
 impl OpteeMsgParam {
     pub fn attr_type(&self) -> OpteeMsgAttrType {
         OpteeMsgAttrType::try_from(self.attr.typ()).unwrap_or(OpteeMsgAttrType::None)
@@ -1469,6 +1478,22 @@ pub struct OpteeMsgArgs {
     pub params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
 }
 
+impl Default for OpteeMsgArgs {
+    fn default() -> Self {
+        Self {
+            cmd: OpteeMessageCommand::OpenSession,
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: TeeResult::Success,
+            ret_origin: TeeOrigin::Tee,
+            num_params: 0,
+            params: [OpteeMsgParam::default(); TEE_NUM_PARAMS + 2],
+        }
+    }
+}
+
 impl OpteeMsgArgs {
     /// Validate the message argument structure.
     pub fn validate(&self) -> Result<(), OpteeSmcReturnCode> {
@@ -1527,6 +1552,7 @@ impl OpteeMsgArgs {
         if index >= self.num_params as usize {
             Err(OpteeSmcReturnCode::ENotAvail)
         } else {
+            self.params[index].attr = OpteeMsgAttr::new().with_typ(OPTEE_MSG_ATTR_TYPE_VALUE_INPUT);
             self.params[index].u.value = value;
             Ok(())
         }
@@ -1544,6 +1570,40 @@ impl OpteeMsgArgs {
         } else {
             // rmem.size and tmem.size are at the same offset as value.b in the union
             self.params[index].u.rmem.size = size;
+            Ok(())
+        }
+    }
+
+    pub fn set_param_memref(&mut self, index: usize,
+            memref: OpteeMsgParamRmem) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].u.rmem = memref;
+            Ok(())
+        }
+    }
+
+    pub fn reset_params(&mut self) -> Result<(), OpteeSmcReturnCode> {
+        for i in 0..(self.num_params as usize) {
+            self.params[i] = OpteeMsgParam {
+                attr: OpteeMsgAttr::default(),
+                u: OpteeMsgParamUnion { octets: [0u8; 24] },
+            };
+        }
+        Ok(())
+    }
+
+    /// Returns the number of parameters in this message.
+    pub fn get_num_params(&self) -> usize {
+        self.num_params as usize
+    }
+
+    pub fn set_param_attr_type(&mut self, index: usize, attr_type: OpteeMsgAttrType) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].attr = OpteeMsgAttr::new().with_typ(attr_type as u8);
             Ok(())
         }
     }
@@ -1605,6 +1665,21 @@ impl OpteeSmcArgs {
         } else {
             Err(OpteeSmcReturnCode::EBadAddr)
         }
+    }
+
+
+    /// Get the physical address of RPC argument structure from an OP-TEE SMC call.
+    /// This is used for `CallWithRpcArg` where the RPC argument is passed separately.
+    pub fn optee_rpc_arg_phys_addr(&self, msg_args: &OpteeMsgArgs) -> Result<u64, OpteeSmcReturnCode> {
+
+        let msg_args_addr = self.optee_msg_args_phys_addr()?;
+        // RPC MsgArg follows immediately after the message args
+
+        let optee_msg_arg_size = 32 ;
+        let optee_msg_param_size = 32 ;
+        Ok(msg_args_addr as u64 +
+            optee_msg_arg_size +
+            msg_args.get_num_params() as u64 * optee_msg_param_size)
     }
 
     /// Set the return code of an OP-TEE SMC call
@@ -1768,8 +1843,11 @@ const OPTEE_SMC_RETURN_ENOMEM: usize = 0x6;
 const OPTEE_SMC_RETURN_ENOTAVAIL: usize = 0x7;
 const OPTEE_SMC_RETURN_UNKNOWN_FUNCTION: usize = 0xffff_ffff;
 
+const OPTEE_SMC_RETURN_RPC_PREFIX_MASK: usize = 0xffff_0000;
+const OPTEE_SMC_RPC_FUNC_CMD:usize = 0x5;
+
 #[non_exhaustive]
-#[derive(Copy, Clone, PartialEq, TryFromPrimitive)]
+#[derive(Copy, Clone, PartialEq, TryFromPrimitive, Debug)]
 #[repr(usize)]
 pub enum OpteeSmcReturnCode {
     Ok = OPTEE_SMC_RETURN_OK,
@@ -1780,6 +1858,7 @@ pub enum OpteeSmcReturnCode {
     EBadCmd = OPTEE_SMC_RETURN_EBADCMD,
     ENomem = OPTEE_SMC_RETURN_ENOMEM,
     ENotAvail = OPTEE_SMC_RETURN_ENOTAVAIL,
+    RpcFunc = OPTEE_SMC_RETURN_RPC_PREFIX_MASK | OPTEE_SMC_RPC_FUNC_CMD,
     UnknownFunction = OPTEE_SMC_RETURN_UNKNOWN_FUNCTION,
 }
 

@@ -7,6 +7,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use x86_64::PhysAddr;
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
     mm::linux::PAGE_SIZE,
@@ -14,8 +15,7 @@ use litebox::{
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin,
-    TeeResult, UteeEntryFunc, UteeParams,
+    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgAttrType, OpteeMsgParamValue, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams
 };
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, interrupts},
@@ -41,9 +41,11 @@ use litebox_shim_optee::msg_handler::{
 use litebox_shim_optee::session::{
     MAX_TA_INSTANCES, SessionMap, SingleInstanceCache, TaInstance, allocate_session_id,
 };
+use litebox_shim_optee::loader::elf::ElfLoaderError;
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
 use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
+use litebox_platform_lvbs::platform_low;
 
 /// # Panics
 ///
@@ -283,6 +285,8 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
         OpteeSmcResult::CallWithArg { msg_args } => {
             let mut msg_args = *msg_args;
             debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
+            debug_serial_println!("OP-TEE SMC with MsgArgs no.of params: {:?}", msg_args.num_params);
+
             let result = match msg_args.cmd {
                 OpenSession => handle_open_session(&mut msg_args, msg_args_phys_addr),
                 InvokeCommand => handle_invoke_command(&mut msg_args, msg_args_phys_addr),
@@ -290,15 +294,51 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                 _ => handle_optee_msg_args(&msg_args),
             };
 
+            match result {
+                Ok(()) => smc_args.set_return_code(OpteeSmcReturnCode::Ok),
+                Err(e) => {
+                    if e == OpteeSmcReturnCode::RpcFunc {
+                        if let Ok(rpc_args_phys_addr) = smc_args.optee_rpc_arg_phys_addr(&msg_args) {
+                            let mut rpc_msg_args = OpteeMsgArgs::default();
+                            debug_serial_println!("PPK: OP-TEE MsgArgs Phys Addr: {:#x} pa ", msg_args_phys_addr);
+                            debug_serial_println!("PPK: OP-TEE PRC MsgArgs Phys Addr: {:#x} pa", rpc_args_phys_addr);
+                            if let Ok(mut ptr) = NormalWorldMutPtr::<OpteeMsgArgs, PAGE_SIZE>::with_usize(rpc_args_phys_addr.truncate()) {
+                                // SAFETY: Reading msg_args from normal world memory at a valid address.
+                                rpc_msg_args = match unsafe { ptr.read_at_offset(0) } {
+                                    Ok(args) => *args,
+                                    Err(_) => {
+                                        debug_serial_println!("PPK: Failed to read RPC Msg Args from VTL0 Addr");
+                                        return make_error_response(OpteeSmcReturnCode::EBadAddr);
+                                    }
+                                };
+                                //rpc_msg_args.reset_params();
+                                rpc_msg_args.num_params = 2;
+                                let uuid = msg_args.get_param_value(0).unwrap();
+                                //rpc_msg_args.params[0].attr = OpteeMsgParamValue::Value { a: uuid, b: 0 };
+                                rpc_msg_args.set_param_value(0, uuid);
+                                rpc_msg_args.set_param_attr_type(0, OpteeMsgAttrType::ValueInput).unwrap();
+                                rpc_msg_args.set_param_memref_size(1, 0).unwrap(); // Empty memref
+                                rpc_msg_args.set_param_attr_type(1, OpteeMsgAttrType::RmemOutput).unwrap();
+                                // SAFETY: Writing rpc_msg_args back to normal world memory.
+                                debug_serial_println!("PPK: Writing RPC Msg Args back to VTL0 Addr");
+                                //unsafe { ptr.write_at_offset(0, rpc_msg_args).unwrap() };
+                                //unsafe { crate::platform_low().copy_to_vtl0_phys::<OpteeMsgArgs>(PhysAddr::new(rpc_args_phys_addr as u64), &rpc_msg_args) };
+                                debug_serial_println!("PPK: Writing RPC Msg Args back to VTL0 Addr SUCCESS");
+                                
+                            }
+                            unsafe { crate::platform_low().copy_to_vtl0_phys::<OpteeMsgArgs>(PhysAddr::new(rpc_args_phys_addr as u64), &rpc_msg_args) };
+
+                        }
+                    }
+                    smc_args.set_return_code(e)
+                },
+            }
             // Always switch back to base page table before returning to VTL0
             // Safety: No user-space memory references are held after this point
             unsafe { switch_to_base_page_table() };
-
-            match result {
-                Ok(()) => smc_args.set_return_code(OpteeSmcReturnCode::Ok),
-                Err(e) => smc_args.set_return_code(e),
-            }
+            debug_serial_println!("PPK: OP-TEE SMC result: {:?}", result);
             *smc_args
+            
         }
         _ => smc_result.into(),
     }
@@ -554,14 +594,18 @@ fn open_session_new_instance(
 
     // Load ldelf and TA - Box immediately to keep at fixed heap address
     let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
-    let loaded_program = Box::new(
-        shim.load_ldelf(LDELF_BINARY, ta_uuid, Some(TA_BINARY), client_identity)
-            .map_err(|_| {
+    let ldelf_t = shim.load_ldelf(LDELF_BINARY, ta_uuid, Some(TA_BINARY), client_identity)
+            .map_err(|e| {
+                debug_serial_println!("PPK1: Failed to open ldelf or TA binary: {:?}", e);
                 unsafe { switch_to_base_page_table() };
                 let _ = platform.delete_task_page_table(task_pt_id);
-                OpteeSmcReturnCode::ENomem
-            })?,
-    );
+                if matches!(e, ElfLoaderError::InvalidUuid) {
+                    OpteeSmcReturnCode::RpcFunc
+                } else {
+                    OpteeSmcReturnCode::ENomem
+                }
+            })?;
+    let loaded_program = Box::new(ldelf_t);
 
     let ta_flags = loaded_program.ta_flags;
 
@@ -1037,8 +1081,10 @@ fn write_msg_args_to_normal_world(
 }
 
 // use include_bytes! to include ldelf and (KMPP) TA binaries
-const LDELF_BINARY: &[u8] = &[0u8; 0];
-const TA_BINARY: &[u8] = &[0u8; 0];
+const LDELF_BINARY: &[u8] = include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/ldelf.elf");
+//const TA_BINARY: &[u8] = include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
+
+const TA_BINARY: &[u8]= &[0u8; 0];
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
