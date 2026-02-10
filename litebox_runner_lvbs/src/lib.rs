@@ -15,7 +15,7 @@ use litebox::{
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgAttrType, OpteeMsgParamValue, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams
+    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgAttrType, OpteeMsgParamValue, OpteeRpcShmType, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams
 };
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, interrupts},
@@ -277,6 +277,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
         smc_args.set_return_code(OpteeSmcReturnCode::EBadAddr);
         return *smc_args;
     };
+    
     let Ok(smc_result) = handle_optee_smc_args(&mut smc_args) else {
         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
         return *smc_args;
@@ -284,7 +285,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
     match smc_result {
         OpteeSmcResult::CallWithArg { msg_args } => {
             let mut msg_args = *msg_args;
-            debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
+            debug_serial_println!("***OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
             debug_serial_println!("OP-TEE SMC with MsgArgs no.of params: {:?}", msg_args.num_params);
 
             let result = match msg_args.cmd {
@@ -312,6 +313,9 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                                     }
                                 };
                                 //rpc_msg_args.reset_params();
+
+                                // FIX: this is to OPTEE_RPC_CMD_LOAD_TA when rpc_args is implemented.
+                                rpc_msg_args.set_cmd(OpteeMessageCommand::OpenSession);
                                 rpc_msg_args.num_params = 2;
                                 let uuid = msg_args.get_param_value(0).unwrap();
                                 //rpc_msg_args.params[0].attr = OpteeMsgParamValue::Value { a: uuid, b: 0 };
@@ -320,13 +324,14 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                                 rpc_msg_args.set_param_memref_size(1, 0).unwrap(); // Empty memref
                                 rpc_msg_args.set_param_attr_type(1, OpteeMsgAttrType::RmemOutput).unwrap();
                                 // SAFETY: Writing rpc_msg_args back to normal world memory.
-                                debug_serial_println!("PPK: Writing RPC Msg Args back to VTL0 Addr");
+                                //debug_serial_println!("PPK: Writing RPC Msg Args back to VTL0 Addr");
                                 //unsafe { ptr.write_at_offset(0, rpc_msg_args).unwrap() };
                                 //unsafe { crate::platform_low().copy_to_vtl0_phys::<OpteeMsgArgs>(PhysAddr::new(rpc_args_phys_addr as u64), &rpc_msg_args) };
-                                debug_serial_println!("PPK: Writing RPC Msg Args back to VTL0 Addr SUCCESS");
+                                //debug_serial_println!("PPK: Writing RPC Msg Args back to VTL0 Addr SUCCESS");
                                 
                             }
                             unsafe { crate::platform_low().copy_to_vtl0_phys::<OpteeMsgArgs>(PhysAddr::new(rpc_args_phys_addr as u64), &rpc_msg_args) };
+                            debug_serial_println!("PPK: Writing RPC Msg Args back to VTL0 Addr SUCCESS");
 
                         }
                     }
@@ -336,10 +341,43 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
             // Always switch back to base page table before returning to VTL0
             // Safety: No user-space memory references are held after this point
             unsafe { switch_to_base_page_table() };
-            debug_serial_println!("PPK: OP-TEE SMC result: {:?}", result);
+            debug_serial_println!(">>> PPK: RpcFunc: LOAD_TA(Gets Size) to VTL0 - 1");
             *smc_args
             
-        }
+        },
+        OpteeSmcResult::ReturnFromRpc { mut rpc_args, msg_args } => {
+            debug_serial_println!("PPK: ReturnFromRpc no.of params: {:?}", rpc_args.num_params);
+            debug_serial_println!("PPK: ReturnFromRpc Required Buf size: {:?}", rpc_args.get_param_memref_size(1).unwrap_or(0));
+            debug_serial_println!("PPK: ReturnFromRpc cmd: {:?}", rpc_args.cmd);
+            let buf_size = rpc_args.get_param_memref_size(1).unwrap_or(0);
+            if buf_size == 0 {
+                debug_serial_println!("PPK: Returned Buffer size is 0, No need to allocate buffer form vTL0");
+                smc_args.set_return_code(OpteeSmcReturnCode::Ok);
+                return *smc_args;
+            }
+            // TODO: This method should requst NW to allocate a shared buffer
+            // of the size of TA (with some alignment)
+
+            //TODO: Is the cmd here LOAD_TA?
+            // Set SMC command to OPTEE_SMC_RETURN_RPC_CMD
+            // Optee cmd = OPTEE_RPC_CMD_SHM_ALLOC
+            //PPK: Ideally this should be OPTEE_RPC_CMD_SHM_ALLOC
+            // Reusing below value for now. If not, I have to duplicate OpteeMsgArgs struct
+            // with a different set of commands and methods.
+            rpc_args.set_cmd(OpteeMessageCommand::DoBottomHalf);
+            rpc_args.num_params = 1;
+            rpc_args.set_param_attr_type(0, OpteeMsgAttrType::ValueInput).unwrap();
+            rpc_args.set_param_value(0, OpteeMsgParamValue { a: OpteeRpcShmType::Appl as u64 , b: buf_size, c: 8 });
+            let rpc_args_phys_addr = smc_args.optee_rpc_arg_phys_addr(&msg_args).expect("Failed to get RPC args physical address");
+            unsafe { crate::platform_low().copy_to_vtl0_phys::<OpteeMsgArgs>(PhysAddr::new(rpc_args_phys_addr as u64), &rpc_args) };
+            debug_serial_println!("PPK: Writing RPC Msg Args back to VTL0 Addr SUCCESS");
+            //smc_args.func_id().set(OpteeSmcFunctionId::ReturnFromRpc as u64);
+            // Below is a TEMP Cookie value
+            smc_args.set_return_code(OpteeSmcReturnCode::RpcFunc);
+            smc_args.split_and_write(0xAAAA_AAAA_BBBB_BBBB, 3, 4);
+            debug_serial_println!(">>> PPK: RpcFunc: RPC_ALLOC to VTL0");
+            *smc_args
+        },
         _ => smc_result.into(),
     }
 }

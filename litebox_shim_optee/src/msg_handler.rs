@@ -73,22 +73,46 @@ pub fn handle_optee_smc_args(
     #[cfg(debug_assertions)]
     litebox::log_println!(
         litebox_platform_multiplex::platform(),
-        "OP-TEE SMC Function: {:?}",
+        "handle_optee_smc_args: OP-TEE SMC Function: {:?}",
         func_id
     );
     match func_id {
         OpteeSmcFunction::CallWithArg
         | OpteeSmcFunction::CallWithRpcArg
-        | OpteeSmcFunction::CallWithRegdArg => {
+        | OpteeSmcFunction::CallWithRegdArg
+        | OpteeSmcFunction::ReturnFromRpc => {
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
-            let msg_args_addr: usize = msg_args_addr.truncate();
+
+            litebox::log_println!(litebox_platform_multiplex::platform(),"handle_optee_smc_args: msg_args_addr = 0x{:#x}\n", msg_args_addr);
+            let msg_args_addr: usize = msg_args_addr.truncate();  
+                        //litebox::log_println!(
+        //litebox_platform_multiplex::platform(),"handle_optee_smc_args: LINE2");
             let mut ptr = NormalWorldConstPtr::<OpteeMsgArgs, PAGE_SIZE>::with_usize(msg_args_addr)
                 .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+                        //litebox::log_println!(
+        //litebox_platform_multiplex::platform(),"handle_optee_smc_args: LINE3");
+            litebox::log_println!(litebox_platform_multiplex::platform(), "handle_optee_smc_args: Optee_Msg Args Phy: {:?}", ptr);
             let msg_args =
                 unsafe { ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
-            Ok(OpteeSmcResult::CallWithArg {
-                msg_args: Box::new(*msg_args),
-            })
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "handle_optee_smc_args: OPtee Message Cmd: {:?}",
+                msg_args.cmd
+            ); 
+            if func_id == OpteeSmcFunction::ReturnFromRpc {
+                let rpc_args_addr = smc.optee_rpc_arg_phys_addr(&msg_args)?;
+                let rpc_args_addr: usize = rpc_args_addr.truncate();
+                let mut ptr = NormalWorldConstPtr::<OpteeMsgArgs, PAGE_SIZE>::with_usize(rpc_args_addr).map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+                let rpc_args =  unsafe { ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+                Ok(OpteeSmcResult::ReturnFromRpc {
+                    msg_args: Box::new(*msg_args),
+                    rpc_args: Box::new(*rpc_args),
+                })
+            } else {
+                Ok(OpteeSmcResult::CallWithArg {
+                    msg_args: Box::new(*msg_args),
+                })
+            }
         }
         OpteeSmcFunction::ExchangeCapabilities => {
             // TODO: update the below when we support more features

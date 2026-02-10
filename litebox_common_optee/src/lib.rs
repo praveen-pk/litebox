@@ -1231,6 +1231,31 @@ impl LdelfArg {
     }
 }
 
+
+/* OP-TEE RPC command IDs */
+const OPTEE_RPC_CMD_LOAD_TA: u32 = 0;
+const OPTEE_RPC_CMD_GET_TIME: u32 = 3;
+const OPTEE_RPC_CMD_SHM_ALLOC: u32 = 6;
+
+/* Memory that can be shared with a non-secure user space application */
+const OPTEE_RPC_SHM_TYPE_APPL: u32 = 0;
+/* Memory only shared with non-secure kernel */
+const OPTEE_RPC_SHM_TYPE_KERNEL: u32 = 1;
+/*
+ * Memory shared with non-secure kernel and exported to a non-secure user
+ * space application
+ */
+const OPTEE_RPC_SHM_TYPE_GLOBAL: u32 = 2;
+
+#[repr(u32)]
+pub enum OpteeRpcShmType {
+    Appl = OPTEE_RPC_SHM_TYPE_APPL,
+    Kernel = OPTEE_RPC_SHM_TYPE_KERNEL,
+    Global = OPTEE_RPC_SHM_TYPE_GLOBAL,
+}
+
+
+
 const OPTEE_MSG_CMD_OPEN_SESSION: u32 = 0;
 const OPTEE_MSG_CMD_INVOKE_COMMAND: u32 = 1;
 const OPTEE_MSG_CMD_CLOSE_SESSION: u32 = 2;
@@ -1607,6 +1632,23 @@ impl OpteeMsgArgs {
             Ok(())
         }
     }
+    pub fn get_param_memref_size(
+        &self,
+        index: usize,
+    ) -> Result<u64, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            // SAFETY: rmem.size and tmem.size are at the same offset in the union,
+            // so reading via either field is safe as long as we've verified the field
+            // is initialized. The caller is responsible for ensuring the union
+            // contains valid data for this access pattern.
+            Ok(unsafe { self.params[index].u.rmem.size })
+        }
+    }
+    pub fn set_cmd(&mut self, cmd: OpteeMessageCommand) {
+        self.cmd = cmd;
+    }
 }
 
 /// A memory page to exchange OP-TEE SMC call arguments.
@@ -1686,12 +1728,24 @@ impl OpteeSmcArgs {
     pub fn set_return_code(&mut self, code: OpteeSmcReturnCode) {
         self.args[0] = code as usize;
     }
+    /// Split a 64-bit value into two 32-bit values and write them to the specified indices.
+    pub fn split_and_write(&mut self, value: u64, index1: usize, index2: usize) {
+        self.args[index1] = (value >> 32) as usize;
+        self.args[index2] = (value & 0xffff_ffff) as usize;
+    }
+
+    pub fn set_arg_value(&mut self, index: usize, value: usize) {
+        if index < Self::NUM_OPTEE_SMC_ARGS {
+            self.args[index] = value;
+        }
+    }
 }
 
 /// `OPTEE_SMC_FUNCID_*` from `core/arch/arm/include/sm/optee_smc.h`
 /// TODO: Add stuffs based on the OP-TEE driver that LVBS is using.
 const OPTEE_SMC_FUNCID_GET_OS_UUID: usize = 0x0;
 const OPTEE_SMC_FUNCID_GET_OS_REVISION: usize = 0x1;
+const OPTEE_SMC_CALL_RETURN_FROM_RPC : usize = 0x3;
 const OPTEE_SMC_FUNCID_CALL_WITH_ARG: usize = 0x4;
 const OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES: usize = 0x9;
 const OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE: usize = 0xa;
@@ -1707,6 +1761,7 @@ pub enum OpteeSmcFunction {
     GetOsUuid = OPTEE_SMC_FUNCID_GET_OS_UUID,
     GetOsRevision = OPTEE_SMC_FUNCID_GET_OS_REVISION,
     CallWithArg = OPTEE_SMC_FUNCID_CALL_WITH_ARG,
+    ReturnFromRpc = OPTEE_SMC_CALL_RETURN_FROM_RPC,
     ExchangeCapabilities = OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES,
     DisableShmCache = OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE,
     CallWithRpcArg = OPTEE_SMC_FUNCID_CALL_WITH_RPC_ARG,
@@ -1753,7 +1808,12 @@ pub enum OpteeSmcResult<'a> {
     CallWithArg {
         msg_args: Box<OpteeMsgArgs>,
     },
+    ReturnFromRpc {
+        rpc_args: Box<OpteeMsgArgs>,
+        msg_args: Box<OpteeMsgArgs>,
+    },
 }
+
 
 impl From<OpteeSmcResult<'_>> for OpteeSmcArgs {
     fn from(value: OpteeSmcResult) -> Self {
@@ -1814,6 +1874,11 @@ impl From<OpteeSmcResult<'_>> for OpteeSmcArgs {
             OpteeSmcResult::CallWithArg { .. } => {
                 panic!(
                     "OpteeSmcResult::CallWithArg cannot be converted to OpteeSmcArgs directly. Handle the incorporated OpteeMsgArgs."
+                );
+            }
+            OpteeSmcResult::ReturnFromRpc { .. } => {
+                panic!(
+                    "OpteeSmcResult::ReturnFromRpc cannot be converted to OpteeSmcArgs directly. Handle the incorporated OpteeMsgArgs."
                 );
             }
         }
