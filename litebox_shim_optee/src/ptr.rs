@@ -235,6 +235,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 PhysPageMapPermissions::READ,
             )?
         };
+        litebox::log_println!(litebox_platform_multiplex::platform(),"PPK:read_slice_at_offset {:#x}", src as usize);
         if (src as usize).is_multiple_of(core::mem::align_of::<T>()) {
             unsafe {
                 core::ptr::copy_nonoverlapping(src, values.as_mut_ptr(), values.len());

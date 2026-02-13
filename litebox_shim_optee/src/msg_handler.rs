@@ -53,12 +53,12 @@ const MAX_NOTIF_VALUE: usize = 0;
 const NUM_RPC_PARMS: usize = 4;
 
 #[inline]
-fn page_align_down(address: u64) -> u64 {
+pub fn page_align_down(address: u64) -> u64 {
     address & !(PAGE_SIZE as u64 - 1)
 }
 
 #[inline]
-fn page_align_up(len: u64) -> u64 {
+pub fn page_align_up(len: u64) -> u64 {
     len.next_multiple_of(PAGE_SIZE as u64)
 }
 
@@ -73,7 +73,7 @@ pub fn handle_optee_smc_args(
     #[cfg(debug_assertions)]
     litebox::log_println!(
         litebox_platform_multiplex::platform(),
-        "handle_optee_smc_args: OP-TEE SMC Function: {:?}",
+        "handle_optee_smc_args: ***handle_optee_smc_args: OP-TEE SMC Function: {:?}",
         func_id
     );
     match func_id {
@@ -83,15 +83,10 @@ pub fn handle_optee_smc_args(
         | OpteeSmcFunction::ReturnFromRpc => {
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
 
-            litebox::log_println!(litebox_platform_multiplex::platform(),"handle_optee_smc_args: msg_args_addr = 0x{:#x}\n", msg_args_addr);
+            //litebox::log_println!(litebox_platform_multiplex::platform(),"handle_optee_smc_args: msg_args_addr = {:#x}\n", msg_args_addr);
             let msg_args_addr: usize = msg_args_addr.truncate();  
-                        //litebox::log_println!(
-        //litebox_platform_multiplex::platform(),"handle_optee_smc_args: LINE2");
             let mut ptr = NormalWorldConstPtr::<OpteeMsgArgs, PAGE_SIZE>::with_usize(msg_args_addr)
                 .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
-                        //litebox::log_println!(
-        //litebox_platform_multiplex::platform(),"handle_optee_smc_args: LINE3");
-            litebox::log_println!(litebox_platform_multiplex::platform(), "handle_optee_smc_args: Optee_Msg Args Phy: {:?}", ptr);
             let msg_args =
                 unsafe { ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
             litebox::log_println!(
@@ -170,6 +165,11 @@ pub fn handle_optee_smc_args(
 /// the message with `handle_ta_request`.
 pub fn handle_optee_msg_args(msg_args: &OpteeMsgArgs) -> Result<(), OpteeSmcReturnCode> {
     msg_args.validate()?;
+    litebox::log_println!(
+        litebox_platform_multiplex::platform(),
+        "handle_optee_smc_args: OP-TEE SMC Function: {:?}",
+        msg_args.cmd
+    );
     match msg_args.cmd {
         OpteeMessageCommand::RegisterShm => {
             let tmem = msg_args.get_param_tmem(0)?;
@@ -188,6 +188,7 @@ pub fn handle_optee_msg_args(msg_args: &OpteeMsgArgs) -> Result<(), OpteeSmcRetu
                 aligned_size,
                 tmem.shm_ref,
             )?;
+            litebox::log_println!(litebox_platform_multiplex::platform(),"handle_optee_smc_args: RegisterShm Done\n");
         }
         OpteeMessageCommand::UnregisterShm => {
             let rmem = msg_args.get_param_rmem(0)?;
@@ -197,7 +198,8 @@ pub fn handle_optee_msg_args(msg_args: &OpteeMsgArgs) -> Result<(), OpteeSmcRetu
             shm_ref_map()
                 .remove(rmem.shm_ref)
                 .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-        }
+            litebox::log_println!(litebox_platform_multiplex::platform(),"handle_optee_smc_args: UnregisterShm Done\n");
+        },
         OpteeMessageCommand::OpenSession
         | OpteeMessageCommand::InvokeCommand
         | OpteeMessageCommand::CloseSession => return Err(OpteeSmcReturnCode::Ok),
@@ -514,7 +516,7 @@ impl<const ALIGN: usize> TryFrom<ShmInfo<ALIGN>> for NormalWorldMutPtr<u8, ALIGN
 /// This data structure is for registering shared memory regions before they are
 /// used during OP-TEE calls with parameters referencing shared memory.
 /// Any normal memory references without this registration will be rejected.
-struct ShmRefMap<const ALIGN: usize> {
+pub struct ShmRefMap<const ALIGN: usize> {
     inner: spin::mutex::SpinMutex<HashMap<u64, ShmInfo<ALIGN>>>,
 }
 
@@ -597,7 +599,7 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
     }
 }
 
-fn shm_ref_map() -> &'static ShmRefMap<PAGE_SIZE> {
+pub fn shm_ref_map() -> &'static ShmRefMap<PAGE_SIZE> {
     static SHM_REF_MAP: OnceBox<ShmRefMap<PAGE_SIZE>> = OnceBox::new();
     SHM_REF_MAP.get_or_init(|| Box::new(ShmRefMap::new()))
 }
@@ -666,14 +668,25 @@ fn get_shm_info_from_optee_msg_param_rmem(
 
 /// Read data from the normal world shared memory pages whose physical addresses are given in
 /// `shm_info` into `buffer`. The size of `buffer` indicates the number of bytes to read.
-fn read_data_from_shm<const ALIGN: usize>(
+pub fn read_data_from_shm<const ALIGN: usize>(
     shm_info: &ShmInfo<ALIGN>,
     buffer: &mut [u8],
 ) -> Result<(), OpteeSmcReturnCode> {
+    //litebox::log_println!(litebox_platform_multiplex::platform(),"read_data_from_shm: Ptr converting\n");
     let mut ptr: NormalWorldConstPtr<u8, ALIGN> = shm_info.clone().try_into()?;
+    //litebox::log_println!(litebox_platform_multiplex::platform(),"read_data_from_shm: Ptr ready\n");
     // SAFETY: The data is copied into a buffer owned by LiteBox to avoid TOCTOU issues.
-    unsafe {
-        ptr.read_slice_at_offset(0, buffer)?;
+    unsafe {       
+        litebox::log_println!(litebox_platform_multiplex::platform(),"read_data_from_shm: Data read Start\n");
+        if let Err(err) = ptr.read_slice_at_offset(0, buffer) {
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "read_data_from_shm: Data read failed: {:?}\n",
+                err
+            );
+            return Err(err.into());
+        }
+        litebox::log_println!(litebox_platform_multiplex::platform(),"read_data_from_shm: Data read DONE\n");
     }
     Ok(())
 }

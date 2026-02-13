@@ -6,6 +6,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use alloc::sync::Arc;
 use x86_64::PhysAddr;
 use core::{ops::Neg, panic::PanicInfo};
@@ -15,7 +16,7 @@ use litebox::{
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgAttrType, OpteeMsgParamValue, OpteeRpcShmType, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams
+    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgAttrType, OpteeMsgParamValue, OpteeRpcShmType, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, OpteeMsgParamRmem
 };
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, interrupts},
@@ -36,13 +37,16 @@ use litebox_platform_lvbs::{
 };
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::msg_handler::{
-    decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
+    decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, page_align_down, page_align_up, read_data_from_shm, shm_ref_map, update_optee_msg_args
 };
 use litebox_shim_optee::session::{
     MAX_TA_INSTANCES, SessionMap, SingleInstanceCache, TaInstance, allocate_session_id,
 };
+
+use litebox_shim_optee::session::{allocate_rpc_context_id, RPC_CONTEXT_MAP};
+
 use litebox_shim_optee::loader::elf::ElfLoaderError;
-use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
+use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, OpteeShimBuilder};
 use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
 use litebox_platform_lvbs::platform_low;
@@ -285,7 +289,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
     match smc_result {
         OpteeSmcResult::CallWithArg { msg_args } => {
             let mut msg_args = *msg_args;
-            debug_serial_println!("***OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
+            debug_serial_println!("optee_smc_handler: OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
             debug_serial_println!("OP-TEE SMC with MsgArgs no.of params: {:?}", msg_args.num_params);
 
             let result = match msg_args.cmd {
@@ -298,7 +302,13 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
             match result {
                 Ok(()) => smc_args.set_return_code(OpteeSmcReturnCode::Ok),
                 Err(e) => {
+
                     if e == OpteeSmcReturnCode::RpcFunc {
+                        let rpc_context_id = allocate_rpc_context_id();
+                        // FIX: this is to OPTEE_RPC_CMD_LOAD_TA when rpc_args is implemented.
+                        RPC_CONTEXT_MAP.insert(rpc_context_id, OpteeMessageCommand::OpenSession as u32);
+                        smc_args.set_rpc_id(rpc_context_id as u64);
+
                         if let Ok(rpc_args_phys_addr) = smc_args.optee_rpc_arg_phys_addr(&msg_args) {
                             let mut rpc_msg_args = OpteeMsgArgs::default();
                             debug_serial_println!("PPK: OP-TEE MsgArgs Phys Addr: {:#x} pa ", msg_args_phys_addr);
@@ -328,7 +338,6 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                                 //unsafe { ptr.write_at_offset(0, rpc_msg_args).unwrap() };
                                 //unsafe { crate::platform_low().copy_to_vtl0_phys::<OpteeMsgArgs>(PhysAddr::new(rpc_args_phys_addr as u64), &rpc_msg_args) };
                                 //debug_serial_println!("PPK: Writing RPC Msg Args back to VTL0 Addr SUCCESS");
-                                
                             }
                             unsafe { crate::platform_low().copy_to_vtl0_phys::<OpteeMsgArgs>(PhysAddr::new(rpc_args_phys_addr as u64), &rpc_msg_args) };
                             debug_serial_println!("PPK: Writing RPC Msg Args back to VTL0 Addr SUCCESS");
@@ -346,37 +355,253 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
             
         },
         OpteeSmcResult::ReturnFromRpc { mut rpc_args, msg_args } => {
-            debug_serial_println!("PPK: ReturnFromRpc no.of params: {:?}", rpc_args.num_params);
-            debug_serial_println!("PPK: ReturnFromRpc Required Buf size: {:?}", rpc_args.get_param_memref_size(1).unwrap_or(0));
-            debug_serial_println!("PPK: ReturnFromRpc cmd: {:?}", rpc_args.cmd);
-            let buf_size = rpc_args.get_param_memref_size(1).unwrap_or(0);
-            if buf_size == 0 {
-                debug_serial_println!("PPK: Returned Buffer size is 0, No need to allocate buffer form vTL0");
-                smc_args.set_return_code(OpteeSmcReturnCode::Ok);
-                return *smc_args;
+            debug_serial_println!("\nPPK: ReturnFromRpc no.of params: {:?}", rpc_args.num_params);
+            //debug_serial_println!("PPK: ReturnFromRpc Required Buf size: {:?}", rpc_args.get_param_memref_size(1).unwrap_or(0));
+            if rpc_args.cmd as u32 == 0 {
+                debug_serial_println!("PPK: ReturnFromRpc CURR rpc_cmd is LOAD_TA");
+            } else if rpc_args.cmd as u32 ==  6 {
+                debug_serial_println!("PPK: ReturnFromRpc CURR rpc_cmd is SHM_ALLOC");
             }
-            // TODO: This method should requst NW to allocate a shared buffer
-            // of the size of TA (with some alignment)
+            else {
+                debug_serial_println!("PPK: ReturnFromRpc CURR rpc_cmd: {:?}", rpc_args.cmd);
+            }
+            
 
-            //TODO: Is the cmd here LOAD_TA?
-            // Set SMC command to OPTEE_SMC_RETURN_RPC_CMD
-            // Optee cmd = OPTEE_RPC_CMD_SHM_ALLOC
-            //PPK: Ideally this should be OPTEE_RPC_CMD_SHM_ALLOC
-            // Reusing below value for now. If not, I have to duplicate OpteeMsgArgs struct
-            // with a different set of commands and methods.
-            rpc_args.set_cmd(OpteeMessageCommand::DoBottomHalf);
-            rpc_args.num_params = 1;
-            rpc_args.set_param_attr_type(0, OpteeMsgAttrType::ValueInput).unwrap();
-            rpc_args.set_param_value(0, OpteeMsgParamValue { a: OpteeRpcShmType::Appl as u64 , b: buf_size, c: 8 });
-            let rpc_args_phys_addr = smc_args.optee_rpc_arg_phys_addr(&msg_args).expect("Failed to get RPC args physical address");
-            unsafe { crate::platform_low().copy_to_vtl0_phys::<OpteeMsgArgs>(PhysAddr::new(rpc_args_phys_addr as u64), &rpc_args) };
-            debug_serial_println!("PPK: Writing RPC Msg Args back to VTL0 Addr SUCCESS");
-            //smc_args.func_id().set(OpteeSmcFunctionId::ReturnFromRpc as u64);
-            // Below is a TEMP Cookie value
-            smc_args.set_return_code(OpteeSmcReturnCode::RpcFunc);
-            smc_args.split_and_write(0xAAAA_AAAA_BBBB_BBBB, 3, 4);
-            debug_serial_println!(">>> PPK: RpcFunc: RPC_ALLOC to VTL0");
-            *smc_args
+            let prev_rpc_id:u32 = smc_args.get_rpc_id() as u32;
+            let prev_rpc_call = RPC_CONTEXT_MAP.get(&prev_rpc_id);
+            debug_serial_println!("PPK: ReturnFromRpc RPC ID from SMC Args: {:?}", prev_rpc_call);
+
+            if let Some(original_cmd) = RPC_CONTEXT_MAP.remove(&prev_rpc_id) {
+                debug_serial_println!("PPK: ReturnFromRpc Original Command for RPC ID {} ->  {:?}\n", prev_rpc_call.unwrap_or(255), original_cmd);
+            } else {
+                debug_serial_println!("PPK: ReturnFromRpc No matching RPC context found for RPC ID {}\n", prev_rpc_id);
+            }
+            /*
+            if prev == SHM_ALLOC
+                read the buffer info
+            if prev == LOAD_TA
+                check attr type, if value:
+                    read size
+                else:
+                    read buffer info
+                    Update Ta bufer map
+                    return THREAD_LIMIT
+             */
+            match prev_rpc_call {
+                // OPTEE_RPC_CMD_SHM_ALLOC
+                Some(cmd) if cmd == OpteeMessageCommand::DoBottomHalf as u32 => {
+                    debug_serial_println!("PPK: ReturnFromRpc PREV RPC CALL : OPTEE_RPC_CMD_SHM_ALLOC");
+                    // As prev_call was OPTEE_RPC_CMD_SHM_ALLOC, the response should be memory buffer info.
+                    
+                    // Extract the shared memory reference from parameter 0
+                    if let Ok(rmem) = rpc_args.get_param_rmem(0) {
+                        debug_serial_println!("PPK: ReturnFromRpc SHM_ALLOC allocated buffer(RMEM):");
+                        debug_serial_println!("  - Offset: {:#x}", rmem.offs);
+                        debug_serial_println!("  - Size: {} bytes", rmem.size);
+                        debug_serial_println!("  - Shared memory ref (shm_ref): {:#x}", rmem.shm_ref);
+                        
+
+                        // TODO: Store this buffer info in a TA buffer map for later use
+                        // The TA will need this information to access the allocated buffer
+                        
+                    } else if let Ok(tmem) = rpc_args.get_param_tmem(0) {
+                        // Alternative: temporary memory reference
+                        debug_serial_println!("PPK: ReturnFromRpc SHM_ALLOC allocated buffer (TMEM):");
+                        debug_serial_println!("  - Physical address (buf_ptr): {:#x}", tmem.buf_ptr);
+                        debug_serial_println!("  - Size: {} bytes", tmem.size);
+                        debug_serial_println!("  - Shared memory ref (shm_ref): {:#x}", tmem.shm_ref);
+                        //let tmem = rpc_args.get_param_tmem(0).unwrap();
+                        if tmem.buf_ptr == 0 || tmem.size == 0 || tmem.shm_ref == 0 {
+                            debug_serial_println!("  - Invalid buffer info received");
+                            return *smc_args;
+                        }
+                        // `tmem.buf_ptr` encodes two different information:
+                        // - The physical page address of the first `ShmRefPagesData`
+                        // - The page offset of the first shared memory page (`pages_list[0]`)
+                        let shm_ref_pages_data_phys_addr = page_align_down(tmem.buf_ptr);
+                        let page_offset = tmem.buf_ptr - shm_ref_pages_data_phys_addr;
+                        let aligned_size = page_align_up(page_offset + tmem.size);
+                        debug_serial_println!("PPK: ReturnFromRPC:CMD_SHM_ALLOC: \n      Aligned physical address of the first shared memory page: {:#x}\n     Aligned size: {:?}", shm_ref_pages_data_phys_addr, aligned_size);
+                        debug_serial_println!("\n      Page offset: {:#x}", page_offset);
+                        shm_ref_map().register_shm(
+                            shm_ref_pages_data_phys_addr,
+                            page_offset,
+                            aligned_size,
+                            tmem.shm_ref,
+                        ).map_err(|_| {
+                            debug_serial_println!("PPK: Failed to register shared memory for SHM_ALLOC");
+                        });
+
+                        // Check if the allocation is sufficient here.
+                        // Final LOAD_TA
+                        rpc_args.set_cmd(OpteeMessageCommand::OpenSession);
+                        rpc_args.num_params = 2;
+                        let uuid = msg_args.get_param_value(0).unwrap();
+                        rpc_args.set_param_value(0, uuid);
+                        rpc_args.set_param_attr_type(0, OpteeMsgAttrType::ValueInput).unwrap();
+
+                        rpc_args.set_param_attr_type(1, OpteeMsgAttrType::RmemOutput).unwrap();
+                        rpc_args.set_param_memref_size(1, tmem.size).unwrap();
+                        rpc_args.set_param_memref(1, OpteeMsgParamRmem { offs: page_offset, size: aligned_size, shm_ref: tmem.shm_ref }).map_err(|_| {
+                            debug_serial_println!("PPK: Failed to set memref param for RPC args");
+                        });
+
+                        let rpc_args_phys_addr = smc_args.optee_rpc_arg_phys_addr(&msg_args).expect("Failed to get RPC args physical address");
+                        unsafe { crate::platform_low().copy_to_vtl0_phys::<OpteeMsgArgs>(PhysAddr::new(rpc_args_phys_addr as u64), &rpc_args) };
+                        smc_args.split_and_write(tmem.shm_ref, 4, 5);
+
+                    } else {
+                        // NOTE: VTL0 could also return non contiguous buffer info. This is currently not supported.
+                        debug_serial_println!("PPK: ReturnFromRpc SHM_ALLOC param 0 is not a memory reference");
+                    }
+
+                    let rpc_context_id = allocate_rpc_context_id();
+                    //PPK: Ideally this should be LOAD_TA
+                    RPC_CONTEXT_MAP.insert(rpc_context_id, OpteeMessageCommand::OpenSession as u32);
+                    debug_serial_println!(">>> PPK: ReturnFromRpc LOAD_TA after SHM_ALLOC to VTL0");
+                    smc_args.set_return_code(OpteeSmcReturnCode::RpcFunc);
+                    smc_args.set_rpc_id(rpc_context_id.into());
+                    return *smc_args;
+                },
+                //OPTEE_RPC_CMD_LOAD
+                Some(cmd) if cmd == OpteeMessageCommand::OpenSession as u32 => {
+                    debug_serial_println!("PPK: ReturnFromRpc PREV RPC CALL : OPTEE_RPC_CMD_LOAD");
+                    let buf_size = rpc_args.get_param_memref_size(1).unwrap_or(0);
+                    if buf_size == 0 {
+                        debug_serial_println!("PPK: Returned Buffer size is 0, No need to allocate buffer form vTL0");
+                        smc_args.set_return_code(OpteeSmcReturnCode::Ok);
+                        return *smc_args;
+                    }
+
+                    if rpc_args.get_param_rmem(1).is_ok()  && rpc_args.get_param_rmem(1).unwrap().shm_ref != 0 
+                    || rpc_args.get_param_tmem(1).is_ok() && rpc_args.get_param_tmem(1).unwrap().buf_ptr != 0 {
+
+                        debug_serial_println!("PPK: Valid memref provided by VTL0, no need to allocate buffer from VTL0");
+                            if let Ok(rmem) = rpc_args.get_param_rmem(1) {
+                            debug_serial_println!("PPK: LOAD_TA buffer info (RMEM) already provided:");
+                            debug_serial_println!("  - Offset: {:#x}", rmem.offs);
+                            debug_serial_println!("  - Size: {} bytes", rmem.size);
+                            debug_serial_println!("  - Shared memory ref (shm_ref): {:#x}", rmem.shm_ref);
+
+                            // Look up the shared memory info from shm_ref
+                            let Some(shm_info) = shm_ref_map().get(rmem.shm_ref) else {
+                                debug_serial_println!("PPK: Shared memory ref not found: {:#x}", rmem.shm_ref);
+                                smc_args.set_return_code(OpteeSmcReturnCode::EBadAddr);
+                                return *smc_args;
+                            };
+
+                            // Convert ShmInfo to NormalWorldConstPtr
+                           /*  let Ok(mut base_ptr) = NormalWorldConstPtr::<u8, PAGE_SIZE>::try_from(shm_info) else {
+                                debug_serial_println!("PPK: Failed to create pointer from shared memory info");
+                                smc_args.set_return_code(OpteeSmcReturnCode::EBadAddr);
+                                return *smc_args;
+                            };*/
+
+                            // Read the TA binary from shared memory (rmem.offs is offset within the shm)
+                            let ta_size = usize::try_from(rmem.size).unwrap();
+                            let ta_offset = usize::try_from(rmem.offs).unwrap();
+                            let mut ta_bin = Vec::with_capacity(ta_size);
+                            ta_bin.resize(ta_size, 0);
+                            
+
+                            read_data_from_shm(&shm_info, &mut ta_bin).map_err(|_| {
+                                debug_serial_println!("PPK: Failed to read TA buffer from shared memory using shm_ref: {:#x}", rmem.shm_ref);
+                            }).unwrap();
+
+                            // Parse TA header and store
+                            let Some(ta_head) = litebox_common_optee::parse_ta_head(&ta_bin) else {
+                                debug_serial_println!("PPK: Failed to parse TA header");
+                                smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                                return *smc_args;
+                            };
+
+                            let optee_shim = OpteeShimBuilder::new().build();
+                            if !optee_shim.store_ta_bin(ta_head.uuid, &ta_bin) {
+                                debug_serial_println!("PPK: Failed to store TA binary in OpteeShim");
+                                smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                                return *smc_args;
+                            }
+
+                            debug_serial_println!("PPK: TA binary successfully stored from RMEM");
+                            smc_args.set_return_code(OpteeSmcReturnCode::EThreadLimit);
+                            return *smc_args;
+
+                        } else if let Ok(tmem) = rpc_args.get_param_tmem(1) {
+                            debug_serial_println!("PPK: LOAD_TA buffer info (TMEM) already provided:");
+                            debug_serial_println!("  - Physical address (buf_ptr): {:#x}", tmem.buf_ptr);
+                            debug_serial_println!("  - Size: {} bytes", tmem.size);
+                            debug_serial_println!("  - Shared memory ref (shm_ref): {:#x}", tmem.shm_ref);
+
+                            let ta_addr = usize::try_from(tmem.buf_ptr).unwrap();
+                            let ta_size = usize::try_from(tmem.size).unwrap();
+                            let Ok(mut ta_ptr) =
+                                NormalWorldConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+                                    ta_addr, ta_size,
+                                )
+                            else {
+                                debug_serial_println!("PPK: Failed to map TA buffer");
+                                smc_args.set_return_code(OpteeSmcReturnCode::EBadAddr);
+                                return *smc_args;
+                            };
+                            let mut ta_bin = Vec::with_capacity(ta_size);
+                            ta_bin.resize(ta_size, 0);
+                            if unsafe { ta_ptr.read_slice_at_offset(0, &mut ta_bin) }.is_err() {
+                                debug_serial_println!("PPK: Failed to read TA buffer");
+                                smc_args.set_return_code(OpteeSmcReturnCode::EBadAddr);
+                                return *smc_args;
+                            }
+
+                            let Some(ta_head) = litebox_common_optee::parse_ta_head(&ta_bin) else {
+                                debug_serial_println!("PPK: Failed to parse TA header from ta_bin");
+                                smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                                return *smc_args;
+                            };
+                            let optee_shim = OpteeShimBuilder::new().build();
+                            if !optee_shim.store_ta_bin(ta_head.uuid, &ta_bin) {
+                                debug_serial_println!("PPK: Failed to store TA binary in OpteeShim");
+                                smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                                return *smc_args;
+                            }
+
+                            debug_serial_println!("PPK: TA binary successfully stored from TMEM");
+                            smc_args.set_return_code(OpteeSmcReturnCode::EThreadLimit);
+                            return *smc_args;
+                        }
+                        else {
+                            debug_serial_println!("PPK: Returned Buffer info is not valid memory reference");
+                            smc_args.set_return_code(OpteeSmcReturnCode::EBadAddr);
+                            return *smc_args;
+                        }
+                     } else {
+                        // Buffer is NOT provided. Only size is provided.
+                        //PPK: Ideally this should be OPTEE_RPC_CMD_SHM_ALLOC
+                        rpc_args.set_cmd(OpteeMessageCommand::DoBottomHalf);
+                        rpc_args.num_params = 1;
+                        rpc_args.set_param_attr_type(0, OpteeMsgAttrType::ValueInput).unwrap();
+                        rpc_args.set_param_value(0, OpteeMsgParamValue { a: OpteeRpcShmType::Appl as u64 , b: buf_size, c: 8 });
+                        let rpc_args_phys_addr = smc_args.optee_rpc_arg_phys_addr(&msg_args).expect("Failed to get RPC args physical address");
+                        unsafe { crate::platform_low().copy_to_vtl0_phys::<OpteeMsgArgs>(PhysAddr::new(rpc_args_phys_addr as u64), &rpc_args) };
+                        debug_serial_println!("PPK: Writing RPC Msg Args back to VTL0 Addr SUCCESS");
+                        //smc_args.func_id().set(OpteeSmcFunctionId::ReturnFromRpc as u64);
+                        
+                        smc_args.set_return_code(OpteeSmcReturnCode::RpcFunc);
+                        // Below is a TEMP Cookie value
+                        smc_args.split_and_write(0xAAAA_AAAA_BBBB_BBBB, 4, 5);
+                        debug_serial_println!(">>> PPK: RpcFunc: RPC_ALLOC to VTL0");
+
+                        let rpc_context_id = allocate_rpc_context_id();
+                        //PPK: Ideally this should be OPTEE_RPC_CMD_SHM_ALLOC
+                        RPC_CONTEXT_MAP.insert(rpc_context_id, OpteeMessageCommand::DoBottomHalf as u32);
+                        smc_args.set_rpc_id(rpc_context_id.into());
+                        return *smc_args;
+                     }
+                },
+                //OPTEE_RPC_CMD_LOAD
+                _ => {
+                    debug_serial_println!("PPK: Other ReturnFromRpc No previous RPC Command found for RPC ID {}", prev_rpc_id);
+                    return *smc_args;
+                },
+            }
         },
         _ => smc_result.into(),
     }

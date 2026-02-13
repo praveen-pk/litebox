@@ -39,8 +39,8 @@ pub mod ptr;
 
 // Re-export session management types for convenience
 pub use session::{
-    MAX_TA_INSTANCES, SessionEntry, SessionManager, SessionMap, SingleInstanceCache, TaInstance,
-    allocate_session_id,
+    allocate_rpc_context_id, allocate_session_id, RpcContextMap, SessionEntry, SessionManager,
+    SessionMap, SingleInstanceCache, TaInstance, RPC_CONTEXT_MAP, MAX_TA_INSTANCES,
 };
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
@@ -203,6 +203,11 @@ type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPoin
 pub struct OpteeShim(Arc<GlobalState>);
 
 impl OpteeShim {
+    /// Store a TA binary in the global TA cache.
+    pub fn store_ta_bin(&self, ta_uuid: TeeUuid, ta_bin: &[u8]) -> bool {
+        self.0.store_ta_bin(&ta_uuid, ta_bin)
+    }
+
     /// Load the given `ldelf` binary into memory while making it ready to load the TA binary specified
     /// by `ta_uuid` (and optionally `ta_bin`). `client` specifies the one requesting the TA load.
     pub fn load_ldelf(

@@ -271,6 +271,83 @@ impl Default for SingleInstanceCache {
     }
 }
 
+/// Global RPC context ID counter.
+static RPC_CONTEXT_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Allocate a new unique RPC context ID.
+pub fn allocate_rpc_context_id() -> u32 {
+    RPC_CONTEXT_ID.fetch_add(1, SeqCst)
+}
+
+/// Map of RPC context IDs to RPC function codes.
+///
+/// This tracks active RPC requests by mapping context_id → rpc_func.
+/// When a thread suspends for RPC, its context ID is stored here along with
+/// the RPC function code (OPTEE_RPC_CMD_*). When normal world returns via
+/// `OPTEE_SMC_CALL_RETURN_FROM_RPC`, the context ID is used to look up
+/// which RPC function was requested.
+pub struct RpcContextMap {
+    /// Maps RPC context ID to RPC function code (OPTEE_RPC_CMD_*).
+    inner: SpinMutex<Option<HashMap<u32, u32>>>,
+    
+}
+
+impl RpcContextMap {
+    /// Create a new empty RPC context map.
+    pub const fn new() -> Self {
+        Self {
+            inner: SpinMutex::new(None),
+        }
+    }
+    
+    /// Ensure the HashMap is initialized.
+    fn ensure_initialized(&self) {
+        let mut guard = self.inner.lock();
+        if guard.is_none() {
+            *guard = Some(HashMap::new());
+        }
+    }
+
+    /// Insert a new RPC context mapping.
+    pub fn insert(&self, context_id: u32, rpc_func: u32) {
+        self.ensure_initialized();
+        self.inner.lock().as_mut().unwrap().insert(context_id, rpc_func);
+    }
+
+    /// Get the RPC function code for a given context ID.
+    pub fn get(&self, context_id: &u32) -> Option<u32> {
+        self.inner.lock().as_ref()?.get(context_id).cloned()
+    }
+
+    /// Remove an RPC context mapping.
+    pub fn remove(&self, context_id: &u32) -> Option<u32> {
+        self.inner.lock().as_mut()?.remove(context_id)
+    }
+
+    /// Get the number of active RPC contexts.
+    pub fn len(&self) -> usize {
+        self.inner.lock().as_ref().map_or(0, |m| m.len())
+    }
+
+    /// Check if there are no active RPC contexts.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().as_ref().map_or(true, |m| m.is_empty())
+    }
+}
+
+impl Default for RpcContextMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global RPC context map for tracking active RPC requests.
+///
+/// This maintains the mapping between RPC context IDs and RPC function codes,
+/// allowing secure world to validate and handle `OPTEE_SMC_CALL_RETURN_FROM_RPC`
+/// responses from normal world.
+pub static RPC_CONTEXT_MAP: RpcContextMap = RpcContextMap::new();
+
 /// Global session ID counter.
 static NEXT_SESSION_ID: AtomicU32 = AtomicU32::new(1);
 

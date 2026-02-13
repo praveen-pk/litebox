@@ -1366,12 +1366,14 @@ const OPTEE_MSG_ATTR_TYPE_NONE: u8 = 0x0;
 const OPTEE_MSG_ATTR_TYPE_VALUE_INPUT: u8 = 0x1;
 const OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT: u8 = 0x2;
 const OPTEE_MSG_ATTR_TYPE_VALUE_INOUT: u8 = 0x3;
+
 const OPTEE_MSG_ATTR_TYPE_RMEM_INPUT: u8 = 0x5;
 const OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT: u8 = 0x6;
 const OPTEE_MSG_ATTR_TYPE_RMEM_INOUT: u8 = 0x7;
 const OPTEE_MSG_ATTR_TYPE_TMEM_INPUT: u8 = 0x9;
-const OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT: u8 = 0xa;
-const OPTEE_MSG_ATTR_TYPE_TMEM_INOUT: u8 = 0xb;
+
+const OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT: u8 = 0xA;
+const OPTEE_MSG_ATTR_TYPE_TMEM_INOUT: u8 = 0xB;
 // Note: `OPTEE_MSG_ATTR_TYPE_FMEM_*` are aliases of `OPTEE_MSG_ATTR_TYPE_RMEM_*`.
 // Whether it is RMEM of FMEM depends on the conduit.
 
@@ -1432,6 +1434,7 @@ impl OpteeMsgParam {
         ) {
             Some(unsafe { self.u.tmem })
         } else {
+            
             None
         }
     }
@@ -1732,6 +1735,15 @@ impl OpteeSmcArgs {
     pub fn split_and_write(&mut self, value: u64, index1: usize, index2: usize) {
         self.args[index1] = (value >> 32) as usize;
         self.args[index2] = (value & 0xffff_ffff) as usize;
+    }
+
+    // set args[3] to the RPC ID which is used by OP-TEE to identify the RPC call. 
+    pub fn set_rpc_id(&mut self, rpc_id: u64) {
+        self.args[3] = rpc_id as usize;
+    }
+
+    pub fn get_rpc_id(&self) -> u64 {
+        self.args[3] as u64
     }
 
     pub fn set_arg_value(&mut self, index: usize, value: usize) {
