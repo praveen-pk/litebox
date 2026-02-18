@@ -71,11 +71,28 @@ pub fn handle_optee_smc_args(
 ) -> Result<OpteeSmcResult<'_>, OpteeSmcReturnCode> {
     let func_id = smc.func_id()?;
     #[cfg(debug_assertions)]
-    litebox::log_println!(
-        litebox_platform_multiplex::platform(),
-        "handle_optee_smc_args: ***handle_optee_smc_args: OP-TEE SMC Function: {:?}",
-        func_id
-    );
+    match func_id {
+        OpteeSmcFunction::CallWithRpcArg => {
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "***CallWithRpcArg SMC from the normal world.\n"
+            );
+        }
+        OpteeSmcFunction::CallWithArg => {
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "***CallWithArg SMC from the normal world.\n"
+            );
+        }
+        OpteeSmcFunction::ReturnFromRpc => {
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "***ReturnFromRpc SMC from the normal world.\n"
+            );
+        }
+        _ => {}
+    }
+
     match func_id {
         OpteeSmcFunction::CallWithArg
         | OpteeSmcFunction::CallWithRpcArg
@@ -84,16 +101,17 @@ pub fn handle_optee_smc_args(
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
 
             //litebox::log_println!(litebox_platform_multiplex::platform(),"handle_optee_smc_args: msg_args_addr = {:#x}\n", msg_args_addr);
-            let msg_args_addr: usize = msg_args_addr.truncate();  
+            let msg_args_addr: usize = msg_args_addr.truncate();
             let mut ptr = NormalWorldConstPtr::<OpteeMsgArgs, PAGE_SIZE>::with_usize(msg_args_addr)
                 .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
             let msg_args =
                 unsafe { ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+
             litebox::log_println!(
                 litebox_platform_multiplex::platform(),
                 "handle_optee_smc_args: OPtee Message Cmd: {:?}",
                 msg_args.cmd
-            ); 
+            );
             if func_id == OpteeSmcFunction::ReturnFromRpc {
                 let rpc_args_addr = smc.optee_rpc_arg_phys_addr(&msg_args)?;
                 let rpc_args_addr: usize = rpc_args_addr.truncate();
@@ -167,7 +185,7 @@ pub fn handle_optee_msg_args(msg_args: &OpteeMsgArgs) -> Result<(), OpteeSmcRetu
     msg_args.validate()?;
     litebox::log_println!(
         litebox_platform_multiplex::platform(),
-        "handle_optee_smc_args: OP-TEE SMC Function: {:?}",
+        "       handle_optee_smc_args: OP-TEE SMC Function: {:?}",
         msg_args.cmd
     );
     match msg_args.cmd {
@@ -676,7 +694,7 @@ pub fn read_data_from_shm<const ALIGN: usize>(
     let mut ptr: NormalWorldConstPtr<u8, ALIGN> = shm_info.clone().try_into()?;
     //litebox::log_println!(litebox_platform_multiplex::platform(),"read_data_from_shm: Ptr ready\n");
     // SAFETY: The data is copied into a buffer owned by LiteBox to avoid TOCTOU issues.
-    unsafe {       
+    unsafe {
         litebox::log_println!(litebox_platform_multiplex::platform(),"read_data_from_shm: Data read Start\n");
         if let Err(err) = ptr.read_slice_at_offset(0, buffer) {
             litebox::log_println!(
