@@ -16,8 +16,7 @@ use litebox::{
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcResult,
-    OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
+    OpteeMsgAttrType, OpteeMsgParamValue, OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeRpcCommand, OpteeRpcShmType, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size
 };
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
@@ -359,7 +358,33 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
         unsafe { switch_to_base_page_table() };
 
         *smc_args
-    } else {
+    }
+    else if let OpteeSmcResult::ReturnFromRpc { msg_args, rpc_args } = smc_result {
+        let mut rpc_args = *rpc_args;
+        let buf_size = rpc_args.get_param_rmem_size(1).unwrap_or(0);
+        if buf_size == 0 {
+            debug_serial_println!("Invalid buffer size in ReturnFromRpc");
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            return *smc_args;
+        }
+        // Request VTL0 to allocate a SHM buffer
+        rpc_args.num_params = 1;
+        rpc_args.cmd = OpteeRpcCommand::ShmAlloc;
+        let _ = rpc_args.set_param_attr_type(0, OpteeMsgAttrType::ValueInput).map_err(|_| {
+            debug_serial_println!("Failed to set RPC param attribute");
+            OpteeSmcReturnCode::EBadCmd
+        });
+
+        // c is for alignment, set it to 8 to ensure the allocated buffer is 8-byte aligned which is required by OP-TEE SMC calls
+        let _ = rpc_args.set_param_value(0, OpteeMsgParamValue { a: OpteeRpcShmType::Appl as u64 , b: buf_size, c: 8 }).map_err(|e| {
+            debug_serial_println!("Failed to set RPC param value: {:?}", e);
+            OpteeSmcReturnCode::EBadCmd
+        });
+         smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
+         let _ = write_rpc_args_to_normal_world(&msg_args, msg_args_phys_addr, &rpc_args);
+         *smc_args
+    }
+    else {
         smc_result.into()
     }
 }

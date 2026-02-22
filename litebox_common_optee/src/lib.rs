@@ -1343,6 +1343,22 @@ pub enum OpteeRpcCommand {
     RpmbProbeFrames = OPTEE_MSG_RPC_CMD_RPMB_PROBE_FRAMES,
 }
 
+/// Memory that can be shared with a non-secure user space application
+const OPTEE_RPC_SHM_TYPE_APPL: u32 = 0;
+/// Memory only shared with non-secure kernel
+const OPTEE_RPC_SHM_TYPE_KERNEL: u32 = 1;
+/// Memory shared with non-secure kernel and exported to a non-secure user
+/// space application
+const OPTEE_RPC_SHM_TYPE_GLOBAL: u32 = 2;
+
+/// OP-TEE RPC shared memory types
+#[repr(u32)]
+pub enum OpteeRpcShmType {
+    Appl = OPTEE_RPC_SHM_TYPE_APPL,
+    Kernel = OPTEE_RPC_SHM_TYPE_KERNEL,
+    Global = OPTEE_RPC_SHM_TYPE_GLOBAL,
+}
+
 /// Temporary memory reference parameter
 ///
 /// `optee_msg_param_tmem` from `optee_os/core/include/optee_msg.h`
@@ -2006,6 +2022,16 @@ impl OpteeRpcArgs {
             Ok(())
         }
     }
+    pub fn get_param_rmem_size(&self, index: usize) -> Result<u64, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            // rmem.size is at byte offset 8 in the 24-byte data, the same position as value.b in the original union.
+            let size_bytes = &self.params[index].data[8..16];
+            Ok(u64::from_le_bytes(size_bytes.try_into().unwrap()))
+        }
+    }
+
     pub fn set_param_rmem(
         &mut self,
         index: usize,
@@ -2113,6 +2139,7 @@ impl OpteeSmcArgs {
 /// TODO: Add stuffs based on the OP-TEE driver that LVBS is using.
 const OPTEE_SMC_FUNCID_GET_OS_UUID: usize = 0x0;
 const OPTEE_SMC_FUNCID_GET_OS_REVISION: usize = 0x1;
+const OPTEE_SMC_FUNCID_RETURN_FROM_RPC: usize = 0x3;
 const OPTEE_SMC_FUNCID_CALL_WITH_ARG: usize = 0x4;
 const OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES: usize = 0x9;
 const OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE: usize = 0xa;
@@ -2127,6 +2154,7 @@ const OPTEE_SMC_FUNCID_CALLS_REVISION: usize = 0xff03;
 pub enum OpteeSmcFunction {
     GetOsUuid = OPTEE_SMC_FUNCID_GET_OS_UUID,
     GetOsRevision = OPTEE_SMC_FUNCID_GET_OS_REVISION,
+    ReturnFromRpc = OPTEE_SMC_FUNCID_RETURN_FROM_RPC,
     CallWithArg = OPTEE_SMC_FUNCID_CALL_WITH_ARG,
     ExchangeCapabilities = OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES,
     DisableShmCache = OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE,
@@ -2174,6 +2202,10 @@ pub enum OpteeSmcResult<'a> {
     CallWithArg {
         msg_args: Box<OpteeMsgArgs>,
         rpc_args: Option<Box<OpteeRpcArgs>>,
+    },
+    ReturnFromRpc {
+        msg_args: Box<OpteeMsgArgs>,
+        rpc_args: Box<OpteeRpcArgs>,
     },
 }
 
@@ -2236,6 +2268,11 @@ impl From<OpteeSmcResult<'_>> for OpteeSmcArgs {
             OpteeSmcResult::CallWithArg { .. } => {
                 panic!(
                     "OpteeSmcResult::CallWithArg cannot be converted to OpteeSmcArgs directly. Handle the incorporated OpteeMsgArgs."
+                );
+            }
+            OpteeSmcResult::ReturnFromRpc { .. } => {
+                panic!(
+                    "OpteeSmcResult::ReturnFromRpc cannot be converted to OpteeSmcArgs directly. Handle the incorporated OpteeMsgArgs and OpteeRpcArgs."
                 );
             }
         }

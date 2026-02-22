@@ -194,6 +194,13 @@ pub fn handle_optee_smc_args(
             let (msg_args, rpc_args ) = read_optee_msg_args_from_phys(msg_args_addr, true)?;
             Ok(OpteeSmcResult::CallWithArg { msg_args, rpc_args })
         }
+        OpteeSmcFunction::ReturnFromRpc => {
+            let msg_args_addr = smc.optee_msg_args_phys_addr()?;
+            let msg_args_addr: usize = msg_args_addr.truncate();
+            let (msg_args, rpc_args ) = read_optee_msg_args_from_phys(msg_args_addr, true)?;
+            let rpc_args = rpc_args.ok_or(OpteeSmcReturnCode::EBadAddr)?;
+            Ok(OpteeSmcResult::ReturnFromRpc { msg_args, rpc_args })
+        }
         OpteeSmcFunction::ExchangeCapabilities => {
             // TODO: update the below when we support more features
             let default_cap = OpteeSecureWorldCapabilities::DYNAMIC_SHM
