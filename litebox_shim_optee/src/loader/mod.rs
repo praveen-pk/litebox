@@ -3,7 +3,7 @@
 
 //! This module contains the loader for the LiteBox shim.
 
-pub(crate) mod elf;
+pub mod elf;
 pub(crate) mod ta_stack;
 
 /// The magic number used to identify the LiteBox rewriter and where we should

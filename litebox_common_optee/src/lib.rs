@@ -1978,6 +1978,46 @@ impl OpteeRpcArgs {
         }
     }
 
+    pub fn set_param_attr_type(
+        &mut self,
+        index: usize,
+        attr_type: OpteeMsgAttrType,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            let current_attr = self.params[index].attr;
+            let new_attr = OpteeMsgAttr((current_attr.0 & !0xff) | (attr_type as u64));
+            self.params[index].attr = new_attr;
+            Ok(())
+        }
+    }
+
+    pub fn set_param_rmem_size(
+        &mut self,
+        index: usize,
+        size: u64,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            // rmem.size is at byte offset 8 in the 24-byte data, the same position as value.b in the original union.
+            self.params[index].data[8..16].copy_from_slice(&size.to_le_bytes());
+            Ok(())
+        }
+    }
+    pub fn set_param_rmem(
+        &mut self,
+        index: usize,
+        rmem: OpteeMsgParamRmem,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].data.copy_from_slice(rmem.as_bytes());
+            Ok(())
+        }
+    }
     // Note: RPC does not use rmem params. Rmem requires pre-registered shared memory
     // references from the normal-world driver, which is a main-messaging-path concept.
     // RPC uses tmem for buffer references since OP-TEE provides physical addresses directly.
@@ -2053,6 +2093,19 @@ impl OpteeSmcArgs {
     /// Set the return code of an OP-TEE SMC call
     pub fn set_return_code(&mut self, code: OpteeSmcReturnCode) {
         self.args[0] = code as usize;
+    }
+
+    /// Get the physical address of the RPC `OpteeMsgArgs` that follows the main message args.
+    ///
+    /// The Linux kernel driver places the RPC arg at offset `optee_msg_args_total_size(num_params)`
+    /// immediately after the main `optee_msg_arg`.
+    pub fn optee_rpc_msg_args_phys_addr(
+        &self,
+        num_params: u32,
+    ) -> Result<u64, OpteeSmcReturnCode> {
+        let msg_args_addr = self.optee_msg_args_phys_addr()?;
+        let msg_args_size = optee_msg_args_total_size(num_params) as u64;
+        Ok(msg_args_addr + msg_args_size)
     }
 }
 

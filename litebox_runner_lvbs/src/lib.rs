@@ -39,7 +39,9 @@ use litebox_platform_lvbs::{
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
+    prepare_load_ta_rpc,
 };
+use litebox_shim_optee::loader::elf::ElfLoaderError;
 use litebox_shim_optee::session::{
     MAX_TA_INSTANCES, SessionIdGuard, SessionManager, TaInstance, allocate_session_id,
 };
@@ -307,19 +309,19 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
         smc_args.set_return_code(OpteeSmcReturnCode::EBadAddr);
         return *smc_args;
     };
-    let Ok(smc_result) = handle_optee_smc_args(&mut smc_args) else {
+    let Ok(mut smc_result) = handle_optee_smc_args(&mut smc_args) else {
         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
         return *smc_args;
     };
     if let OpteeSmcResult::CallWithArg {
         msg_args,
-        rpc_args: _,
+        ref mut rpc_args,
     } = smc_result
     {
         let mut msg_args = *msg_args;
         debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
         let result = match msg_args.cmd {
-            OpenSession => handle_open_session(&mut msg_args, msg_args_phys_addr),
+            OpenSession => handle_open_session(&mut msg_args, rpc_args, msg_args_phys_addr),
             InvokeCommand => handle_invoke_command(&mut msg_args, msg_args_phys_addr),
             CloseSession => handle_close_session(&mut msg_args, msg_args_phys_addr),
             _ => {
@@ -335,15 +337,27 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
             }
         };
 
+        if let Err(e) = result {
+            if e == OpteeSmcReturnCode::RpcCmd {
+                if rpc_args.is_none() {
+                    debug_serial_println!("RPC args should be provided for RPC commands");
+                    smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                    return *smc_args;
+                }
+                let rpc_args_ref = rpc_args.as_ref().unwrap();
+                let _ = write_rpc_args_to_normal_world(&msg_args, msg_args_phys_addr, rpc_args_ref);
+                smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
+            } else {
+                smc_args.set_return_code(e);
+            }
+        } else {
+            smc_args.set_return_code(OpteeSmcReturnCode::Ok);
+        }
+
         // Always switch back to base page table before returning to VTL0
         // Safety: No user-space memory references are held after this point
         unsafe { switch_to_base_page_table() };
 
-        if let Err(e) = result {
-            smc_args.set_return_code(e);
-        } else {
-            smc_args.set_return_code(OpteeSmcReturnCode::Ok);
-        }
         *smc_args
     } else {
         smc_result.into()
@@ -361,6 +375,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
 /// instance cleanup for TARGET_DEAD on single-instance TAs with no other sessions).
 fn handle_open_session(
     msg_args: &mut OpteeMsgArgs,
+    rpc_args: &mut Option<Box<OpteeRpcArgs>>,
     msg_args_phys_addr: u64,
 ) -> Result<(), OpteeSmcReturnCode> {
     let ta_req_info = decode_ta_request(msg_args).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
@@ -386,6 +401,7 @@ fn handle_open_session(
     } else {
         open_session_new_instance(
             msg_args,
+            rpc_args,
             msg_args_phys_addr,
             params,
             ta_uuid,
@@ -566,6 +582,7 @@ fn open_session_single_instance(
 /// Per OP-TEE OS semantics: if OpenSession returns non-success, cleanup happens.
 fn open_session_new_instance(
     msg_args: &mut OpteeMsgArgs,
+    rpc_args: &mut Option<Box<OpteeRpcArgs>>,
     msg_args_phys_addr: u64,
     params: &[litebox_common_optee::UteeParamOwned],
     ta_uuid: litebox_common_optee::TeeUuid,
@@ -609,11 +626,33 @@ fn open_session_new_instance(
             client_identity,
             runner_session_id,
         )
-        .map_err(|_| {
-            unsafe { switch_to_base_page_table() };
-            // Safety: We've switched to the base page table above.
-            let _ = unsafe { delete_task_page_table(task_pt_id) };
-            OpteeSmcReturnCode::ENomem
+        .map_err(|e| {
+            match e {
+                ElfLoaderError::InvalidUuid => {
+                    if rpc_args.is_none() {
+                        debug_serial_println!("TA binary not found and no RPC args provided for UUID: {:?}", ta_uuid);
+                        return OpteeSmcReturnCode::EBadCmd;
+                    }
+                    debug_serial_println!("TA binary not found for UUID: {:?}", ta_uuid);
+                    debug_serial_println!("RPC to VTL0 to get the TA binary");
+                    let Ok(uuid) = msg_args.get_param_value(0) else {
+                        return OpteeSmcReturnCode::EBadCmd;
+                    };
+                    let Some(rpc_args_mut) = rpc_args.as_mut().map(|b| &mut **b) else {
+                        return OpteeSmcReturnCode::EBadCmd;
+                    };
+                    if prepare_load_ta_rpc(rpc_args_mut, uuid, 0, None).is_err() {
+                        return OpteeSmcReturnCode::EBadCmd;
+                    }
+                    OpteeSmcReturnCode::RpcCmd
+                },
+                _ => {
+                    unsafe { switch_to_base_page_table() };
+                    // Safety: We've switched to the base page table above.
+                    let _ = unsafe { delete_task_page_table(task_pt_id) };
+                    OpteeSmcReturnCode::ENomem
+                },
+            }
         })?,
     );
 
@@ -1132,7 +1171,6 @@ fn write_non_ta_msg_args_to_normal_world(
 /// Unlike [`write_msg_args_to_normal_world`], this function does not access TA userspace
 /// memory and can be called from the base page table context. It simply serializes the
 /// rpc_args and writes it to the normal world physical address.
-#[expect(dead_code)]
 #[inline]
 fn write_rpc_args_to_normal_world(
     msg_args: &OpteeMsgArgs,
@@ -1155,8 +1193,12 @@ fn write_rpc_args_to_normal_world(
 }
 
 // use include_bytes! to include ldelf and (KMPP) TA binaries
-const LDELF_BINARY: &[u8] = &[0u8; 0];
+//const LDELF_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARY: &[u8] = &[0u8; 0];
+const LDELF_BINARY: &[u8] =
+    include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/ldelf.elf");
+//const TA_BINARY: &[u8] = include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
+
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
