@@ -9,9 +9,12 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap as HashMap;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt;
+use spin::mutex::SpinMutex;
 use litebox_common_linux::{PtRegs, errno::Errno};
 use num_enum::TryFromPrimitive;
 use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
@@ -2133,6 +2136,16 @@ impl OpteeSmcArgs {
         let msg_args_size = optee_msg_args_total_size(num_params) as u64;
         Ok(msg_args_addr + msg_args_size)
     }
+
+    /// Set args[3] to the RPC ID which is used by OP-TEE to identify the RPC call.
+    pub fn set_rpc_id(&mut self, rpc_id: u64) {
+        self.args[3] = rpc_id as usize;
+    }
+
+    /// Get the RPC ID from args[3].
+    pub fn get_rpc_id(&self) -> usize {
+        self.args[3]
+    }
 }
 
 /// `OPTEE_SMC_FUNCID_*` from `core/arch/arm/include/sm/optee_smc.h`
@@ -2384,6 +2397,77 @@ pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
     }
     None
 }
+
+/// Global RPC context ID counter.
+static RPC_CONTEXT_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Allocate a new unique RPC context ID.
+pub fn allocate_rpc_context_id() -> u32 {
+    RPC_CONTEXT_ID.fetch_add(1, SeqCst)
+}
+
+/// Map of RPC context IDs to RPC function codes.
+///
+/// This tracks active RPC requests by mapping context_id → rpc_func.
+/// When a thread suspends for RPC, its context ID is stored here along with
+/// the RPC function code (OPTEE_RPC_CMD_*). When normal world returns via
+/// `OPTEE_SMC_CALL_RETURN_FROM_RPC`, the context ID is used to look up
+/// which RPC function was requested.
+pub struct RpcContextMap {
+    /// Maps RPC context ID to RPC function code (OPTEE_RPC_CMD_*).
+    inner: SpinMutex<Option<HashMap<u32, u32>>>,
+}
+
+impl RpcContextMap {
+    /// Create a new empty RPC context map.
+    pub const fn new() -> Self {
+        Self {
+            inner: SpinMutex::new(None),
+        }
+    }
+
+    /// Ensure the HashMap is initialized.
+    fn ensure_initialized(&self) {
+        let mut guard = self.inner.lock();
+        if guard.is_none() {
+            *guard = Some(HashMap::new());
+        }
+    }
+
+    /// Insert a new RPC context mapping.
+    pub fn insert(&self, context_id: u32, rpc_func: u32) {
+        self.ensure_initialized();
+        self.inner.lock().as_mut().unwrap().insert(context_id, rpc_func);
+    }
+
+    /// Get the RPC function code for a given context ID.
+    pub fn get(&self, context_id: &u32) -> Option<u32> {
+        self.inner.lock().as_ref()?.get(context_id).cloned()
+    }
+
+    /// Remove an RPC context mapping.
+    pub fn remove(&self, context_id: &u32) -> Option<u32> {
+        self.inner.lock().as_mut()?.remove(context_id)
+    }
+
+    /// Check if there are no active RPC contexts.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().as_ref().map_or(true, |m| m.is_empty())
+    }
+}
+
+impl Default for RpcContextMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global RPC context map for tracking active RPC requests.
+///
+/// This maintains the mapping between RPC context IDs and RPC function codes,
+/// allowing secure world to validate and handle `OPTEE_SMC_CALL_RETURN_FROM_RPC`
+/// responses from normal world.
+pub static RPC_CONTEXT_MAP: RpcContextMap = RpcContextMap::new();
 
 #[cfg(test)]
 mod tests {

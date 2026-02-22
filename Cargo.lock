@@ -828,6 +828,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "num_enum",
+ "spin 0.9.8",
  "thiserror",
  "zerocopy",
 ]
