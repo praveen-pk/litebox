@@ -1969,6 +1969,16 @@ impl OpteeRpcArgs {
         }
     }
 
+    pub fn get_param_rmem(&self, index: usize) -> Result<OpteeMsgParamRmem, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index]
+                .get_param_rmem()
+                .ok_or(OpteeSmcReturnCode::EBadCmd)
+        }
+    }
+
     /// Set a value parameter by index with bounds checking against `num_params`.
     pub fn set_param_value(
         &mut self,
@@ -2143,8 +2153,13 @@ impl OpteeSmcArgs {
     }
 
     /// Get the RPC ID from args[3].
-    pub fn get_rpc_id(&self) -> usize {
-        self.args[3]
+    pub fn get_rpc_id(&self) -> u32 {
+        (self.args[3] & 0xffff_ffff) as u32
+    }
+
+    pub fn split_and_write(&mut self, value: u64, index1: usize, index2: usize) {
+        self.args[index1] = (value >> 32) as usize;
+        self.args[index2] = (value & 0xffff_ffff) as usize;
     }
 }
 
