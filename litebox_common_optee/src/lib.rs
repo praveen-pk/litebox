@@ -2161,6 +2161,12 @@ impl OpteeSmcArgs {
         self.args[index1] = (value >> 32) as usize;
         self.args[index2] = (value & 0xffff_ffff) as usize;
     }
+
+    pub fn get_shm_ref(&self, index1: usize, index2: usize) -> u64 {
+        let high = self.args[index1] as u64;
+        let low = self.args[index2] as u64;
+        (high << 32) | low
+    }
 }
 
 /// `OPTEE_SMC_FUNCID_*` from `core/arch/arm/include/sm/optee_smc.h`
@@ -2391,7 +2397,6 @@ impl From<OpteeSmcReturnCode> for litebox_common_linux::errno::Errno {
 pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
     use core::mem::size_of;
     use elf::{ElfBytes, endian::AnyEndian};
-
     let elf = ElfBytes::<AnyEndian>::minimal_parse(elf_data).ok()?;
     let (shdrs, strtab) = elf.section_headers_with_strtab().ok()?;
     let shdrs = shdrs?;
@@ -2412,7 +2417,6 @@ pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
     }
     None
 }
-
 /// Global RPC context ID counter.
 static RPC_CONTEXT_ID: AtomicU32 = AtomicU32::new(0);
 

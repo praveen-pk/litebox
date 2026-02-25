@@ -19,8 +19,7 @@ use litebox::{
 use litebox_shim_optee::OpteeShimBuilder;
 use litebox_common_linux::errno::Errno;
 use litebox_common_optee::{
-    OpteeMsgAttrType, OpteeMsgParamValue, OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeRpcCommand, OpteeRpcShmType, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
-    allocate_rpc_context_id, RPC_CONTEXT_MAP, OpteeMsgParamRmem,
+    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgAttrType, OpteeMsgParamRmem, OpteeMsgParamValue, OpteeRpcArgs, OpteeRpcCommand, OpteeRpcShmType, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, RPC_CONTEXT_MAP, TeeOrigin, TeeResult, TeeUuid, UteeEntryFunc, UteeParams, allocate_rpc_context_id, optee_msg_args_total_size
 };
 use x86_64::PhysAddr;
 use litebox_platform_lvbs::platform_low;
@@ -45,6 +44,7 @@ use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
     prepare_load_ta_rpc, page_align_down, page_align_up, shm_ref_map, read_data_from_shm,
+    get_shm_info_from_optee_msg_param_rmem,
 };
 use litebox_shim_optee::loader::elf::ElfLoaderError;
 use litebox_shim_optee::session::{
@@ -382,6 +382,28 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
         RPC_CONTEXT_MAP.remove(&rpc_context_id);
         let mut rpc_args = *rpc_args;
         /* PPK */
+        match rpc_args.cmd {
+            OpteeRpcCommand::LoadTa => {
+                debug_serial_println!("Curr RPC Cmd: OpteeRpcCommand::LoadTa");
+            },
+            OpteeRpcCommand::ShmAlloc => {
+                debug_serial_println!("Curr RPC Cmd: OpteeRpcCommand::ShmAlloc");
+            },
+            _ => {
+               debug_serial_println!("Curr RPC Cmd: Unknown");
+            }
+        }
+        match prev_rpc_cmd {
+            val if val == OpteeRpcCommand::LoadTa as u32=> {
+                debug_serial_println!("Return from LoadTa RPC");
+            },
+            val if val == OpteeRpcCommand::ShmAlloc as u32 => {
+                debug_serial_println!("Return from ShmAlloc RPC");
+            },
+            _ => {
+               debug_serial_println!("Return from unknown RPC: rpc_cmd={:#x}", prev_rpc_cmd);
+            }
+        }
         match prev_rpc_cmd {
             val if val == OpteeRpcCommand::LoadTa as u32=> {
                 // Check if any addresses were returned
@@ -389,6 +411,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                 // SHM_ALLOC returns TMEM buffer
 
                 // PPK: Load TA might use Rmem, re-check
+                // PPK: TODO: Do not rely on shm_ref in the response here.
                 if rpc_args.get_param_rmem(1).is_ok() && rpc_args.get_param_rmem(1).unwrap().shm_ref != 0 {
                    debug_serial_println!("RMEM returned from LoadTa RPC");
                    let Ok(rmem) = rpc_args.get_param_rmem(1) else {
@@ -396,42 +419,89 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                        return *smc_args;
                    };
-                   let Some(shm_info) = shm_ref_map().get(rmem.shm_ref) else {
+                   /*let Some(shm_info) = shm_ref_map().get(rmem.shm_ref) else {
                        debug_serial_println!("Failed to find SHM info for shm_ref: {}", rmem.shm_ref);
                        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                        return *smc_args;
                    };
+
+                   let Some(ta_offset) = usize::try_from(rmem.offs).ok() else {
+                       debug_serial_println!("Invalid TA offset in RMEM param: {}", rmem.offs);
+                       smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                       return *smc_args;
+                   };*/
                    let Some(ta_size) = usize::try_from(rmem.size).ok() else {
                        debug_serial_println!("Invalid TA size in RMEM param: {}", rmem.size);
                        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                        return *smc_args;
                    };
-                   let Some(ta_offset) = usize::try_from(rmem.offs).ok() else {
-                       debug_serial_println!("Invalid TA offset in RMEM param: {}", rmem.offs);
-                       smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
-                       return *smc_args;
-                   };
+                   debug_serial_println!("DEBUG: RMEM info - offs: {:#x}, size: {}, shm_ref: {:#x}, ta_size: {}", rmem.offs, rmem.size, rmem.shm_ref, ta_size);
+                   //let smc_shm_ref = smc_args.get_shm_ref(4, 5);
+                   // debug_serial_println!("DEBUG: SMC shm_ref: {:#x}", smc_shm_ref);
 
-                   let mut ta_bin = Vec::with_capacity(ta_size);
-                    read_data_from_shm(&shm_info, &mut ta_bin).map_err(|_| {
-                                debug_serial_println!("Failed to read TA buffer from shared memory using shm_ref: {:#x}", rmem.shm_ref);
-                            }).unwrap();
-
-                    debug_serial_println!("Successfully read TA binary from shared memory, size: {}", ta_bin.len());
-                    let Some(ta_head) = litebox_common_optee::parse_ta_head(&ta_bin) else {
-                                debug_serial_println!("PPK: Failed to parse TA header");
-                                smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                   /*let shm_info = get_shm_info_from_optee_msg_param_rmem(rmem).map_err(|e| {
+                                debug_serial_println!("Failed to get SHM info from RMEM param: {:?}", e);
+                                OpteeSmcReturnCode::EBadCmd
+                            }).unwrap();*/
+                    let Some(shm_info) = shm_ref_map().get(rmem.shm_ref) else {
+                                debug_serial_println!("Shared memory ref not found: {:#x}", rmem.shm_ref);
+                                smc_args.set_return_code(OpteeSmcReturnCode::EBadAddr);
                                 return *smc_args;
                             };
 
-                    /*let optee_shim = OpteeShimBuilder::new().build();
-                    if !optee_shim.store_ta_bin(ta_head.uuid, &ta_bin) {
+                    //debug_serial_println!("DEBUG: SHM info Found - phys_addr: {:#x}, size: {}, page_offset: {:#x}", shm_info.phys_addr, shm_info.size, shm_info.page_offset);
+                    //let aligned_ta_size = page_align_up(ta_size as u64);
+                    //let mut ta_bin = vec![0u8; aligned_ta_size as usize];
+                    // TODO: Dont use aligned up size here.
+                    let mut ta_bin = vec![0u8; ta_size as usize];
+
+                    if let Err(e) = read_data_from_shm(&shm_info, &mut ta_bin) {
+                        debug_serial_println!(
+                        "Failed to read TA buffer from shared memory using shm_ref: {:#x}, err={:?}",
+                        rmem.shm_ref,e
+                        );
+                        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                        return *smc_args;
+                    }
+
+                    //debug_serial_println!("TA binary first 10 bytes: {:#x?}", &ta_bin[..ta_bin.len().min(10)]);
+                    debug_serial_println!("Successfully read TA binary from shared memory, size: {}", ta_bin.len());
+                    debug_serial_println!("TA binary first 16 bytes: {:#x?}", &ta_bin[..ta_bin.len().min(16)]);
+                    debug_serial_println!("TA binary last 16 bytes: {:#x?}", &ta_bin[ta_bin.len().saturating_sub(16)..]);
+
+                    /*let Some(ta_head) = litebox_common_optee::parse_ta_head(&ta_bin) else {
+                                debug_serial_println!("PPK: Failed to parse TA header");
+                                smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                                return *smc_args;
+                            };*/
+
+                    let optee_shim= OpteeShimBuilder::new().build();
+                    let uuid = match msg_args.get_param_value(0) {
+                        Ok(param) => param,
+                        Err(e) => {
+                            debug_serial_println!("**Failed to get UUID param from LoadTa RPC: {:?}", e);
+                            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                            return *smc_args;
+                        }
+                    };
+                    let uuid_arr =[uuid.a,uuid.b];
+                    let ret = optee_shim.store_ta_bin(&TeeUuid::from_u64_array(uuid_arr), &ta_bin);
+                    if ret == false {
+                        debug_serial_println!("PPK: Failed to store TA binary in OpteeShim");
+                        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                        return *smc_args;
+                    }
+                    // TODO: Delete shm_ref
+                    /*if !optee_shim.register_ta_bin(ta_head.uuid, &ta_bin) {
                                 debug_serial_println!("PPK: Failed to store TA binary in OpteeShim");
                                 smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                                 return *smc_args;
                             }*/
+                    //debug_serial_println!("TA binary stored in OpteeShim successfully: EThreadLimit");
                     //smc_args.set_return_code(OpteeSmcReturnCode::EThreadLimit);
-                    smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                    debug_serial_println!("TA binary stored in OpteeShim successfully: oK");
+                    smc_args.set_return_code(OpteeSmcReturnCode::Ok);
+                    //smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                     return *smc_args;
 
                 } else {
@@ -474,13 +544,14 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                 let tmem_buf_ptr_phys_addr = page_align_down(tmem.buf_ptr);
                 let page_offset = (tmem.buf_ptr - tmem_buf_ptr_phys_addr) as usize;
                 let aligned_size = page_align_up((page_offset + tmem.size as usize).try_into().unwrap());
+                debug_serial_println!("DEBUG: shm_ref from SHM_ALLOC RPC: {:#x}, buf_ptr: {:#x}, size: {}", tmem.shm_ref, tmem.buf_ptr, tmem.size);
                 let _ = shm_ref_map().register_shm(
                             tmem_buf_ptr_phys_addr,
                             page_offset as u64,
                             aligned_size,
                             tmem.shm_ref,
                         ).map_err(|_| {
-                            debug_serial_println!("Failed to register TMEM received in SHM_ALLOC RPC");
+                            debug_serial_println!("ERROR: Failed to register TMEM received in SHM_ALLOC RPC");
                             smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                             return *smc_args;
                         });
@@ -490,9 +561,9 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                 rpc_args.cmd = OpteeRpcCommand::LoadTa;
                 rpc_args.num_params = 2;
                 let uuid = msg_args.get_param_value(0).unwrap();
-                let _ = rpc_args.set_param_value(0, uuid);
                 rpc_args.set_param_attr_type(0, OpteeMsgAttrType::ValueInput).unwrap();
-                rpc_args.set_param_attr_type(1, OpteeMsgAttrType::RmemOutput).unwrap();
+                let _ = rpc_args.set_param_value(0, uuid);
+                rpc_args.set_param_attr_type(1, OpteeMsgAttrType::RmemInput).unwrap();
                 // PPK: Check if aligned size should be used in below statements
                 rpc_args.set_param_rmem_size(1, tmem.size).unwrap();
                 let _ = rpc_args.set_param_rmem(1, OpteeMsgParamRmem { offs: page_offset as u64, size: tmem.size, shm_ref: tmem.shm_ref }).map_err(|_| {
@@ -784,11 +855,18 @@ fn open_session_new_instance(
 
     // Load ldelf and TA - Box immediately to keep at fixed heap address
     let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
+    let ta_binary = match shim.get_ta_bin(&ta_uuid) {
+         Some(bin) => bin,
+         None => {
+             debug_serial_println!("TA binary not found in UUID Map: {:?}", ta_uuid);
+             Box::new([0u8; 0])
+         }
+    };
     let loaded_program = Box::new(
         shim.load_ldelf(
             LDELF_BINARY,
             ta_uuid,
-            Some(TA_BINARY),
+            Some(&ta_binary),
             client_identity,
             runner_session_id,
         )

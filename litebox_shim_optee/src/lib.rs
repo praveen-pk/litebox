@@ -286,6 +286,19 @@ impl OpteeShim {
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
         &self.0.pm
     }
+
+    /// Store a TA binary associated with the given TA UUID.
+    ///
+    /// Returns `true` if the binary was successfully stored, `false` if the binary's
+    /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
+    pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
+        self.0.store_ta_bin(ta_uuid, ta_bin)
+    }
+
+    pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+        self.0.get_ta_bin(ta_uuid)
+    }
+
 }
 
 impl OpteeShimEntrypoints {
@@ -1211,11 +1224,19 @@ impl TaUuidMap {
     pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: alloc::boxed::Box<[u8]>) -> bool {
         // Parse TA head from the binary's .ta_head section
         let Some(ta_head) = litebox_common_optee::parse_ta_head(&ta_bin) else {
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "Failed to parse .ta_head for TA UUID "
+            );
             return false;
         };
 
         // Verify that the TA binary's UUID matches the expected UUID
         if ta_head.uuid != uuid {
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "TA UUID mismatch for TA binary"
+            );
             return false;
         }
 

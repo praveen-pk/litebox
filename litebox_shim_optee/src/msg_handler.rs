@@ -175,7 +175,7 @@ pub fn handle_optee_smc_args(
     #[cfg(debug_assertions)]
     litebox::log_println!(
         litebox_platform_multiplex::platform(),
-        "OP-TEE SMC Function: {:?}",
+        "**OP-TEE SMC Function: {:?}",
         func_id
     );
     match func_id {
@@ -781,7 +781,7 @@ fn get_shm_info_from_optee_msg_param_tmem(
 ///
 /// `rmem.offs` must be an offset within the shared memory region registered with `rmem.shm_ref` before
 /// and `rmem.offs + rmem.size` must not exceed the size of the registered shared memory region.
-fn get_shm_info_from_optee_msg_param_rmem(
+pub fn get_shm_info_from_optee_msg_param_rmem(
     rmem: OpteeMsgParamRmem,
 ) -> Result<ShmInfo<PAGE_SIZE>, OpteeSmcReturnCode> {
     let Some(shm_info) = shm_ref_map().get(rmem.shm_ref) else {
@@ -810,12 +810,43 @@ pub fn read_data_from_shm<const ALIGN: usize>(
     shm_info: &ShmInfo<ALIGN>,
     buffer: &mut [u8],
 ) -> Result<(), OpteeSmcReturnCode> {
-    let mut ptr: NormalWorldConstPtr<u8, ALIGN> = shm_info.clone().try_into()?;
+    let mut ptr: NormalWorldConstPtr<u8, ALIGN> = match shm_info.clone().try_into() {
+        Ok(p) => p,
+        Err(e) => {
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "ERROR: Failed to convert ShmInfo to NormalWorldConstPtr: {:?}",
+                e
+            );
+            return Err(OpteeSmcReturnCode::EBadAddr);
+        }
+    };
+
+    litebox::log_println!(
+        litebox_platform_multiplex::platform(),
+        "Reading data from shared memory: buffer len = {}",
+        buffer.len()
+    );
+
     // SAFETY: The data is copied into a buffer owned by LiteBox to avoid TOCTOU issues.
-    unsafe {
-        ptr.read_slice_at_offset(0, buffer)?;
+    match unsafe { ptr.read_slice_at_offset(0, buffer) } {
+        Ok(()) => {
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "Successfully read {} bytes from shared memory",
+                buffer.len()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "ERROR: Failed to read_slice_at_offset: {:?}",
+                e
+            );
+            Err(OpteeSmcReturnCode::EBadAddr)
+        }
     }
-    Ok(())
 }
 
 /// Write data in `buffer` to the normal world shared memory pages whose physical addresses are given
