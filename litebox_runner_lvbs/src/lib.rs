@@ -41,6 +41,7 @@ use litebox_platform_lvbs::{
     serial_println,
 };
 use litebox_platform_multiplex::Platform;
+use litebox_shim_optee::ppk_ta_uuid_map;
 use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
     prepare_load_ta_rpc, page_align_down, page_align_up, shm_ref_map, read_data_from_shm,
@@ -484,8 +485,12 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                             return *smc_args;
                         }
                     };
-                    let uuid_arr =[uuid.a,uuid.b];
-                    let ret = optee_shim.store_ta_bin(&TeeUuid::from_u64_array(uuid_arr), &ta_bin);
+                    let my_ta_uuid_map = ppk_ta_uuid_map();
+
+                    let uuid_arr: [u64; 2] =[uuid.a,uuid.b];
+                    let ta_uuid_obj = TeeUuid::from_u64_array(uuid_arr);
+                    my_ta_uuid_map.insert(ta_uuid_obj, ta_bin.clone().into());
+                    let ret = optee_shim.store_ta_bin(&ta_uuid_obj, &ta_bin);
                     if ret == false {
                         debug_serial_println!("PPK: Failed to store TA binary in OpteeShim");
                         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
@@ -855,13 +860,21 @@ fn open_session_new_instance(
 
     // Load ldelf and TA - Box immediately to keep at fixed heap address
     let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
-    let ta_binary = match shim.get_ta_bin(&ta_uuid) {
+    let my_ta_uuid_map = ppk_ta_uuid_map();
+     let ta_binary = match my_ta_uuid_map.get(&ta_uuid) {
+         Some(info) => info,
+         None => {
+             debug_serial_println!("TA binary not found in MY UUID Map: {:?}", ta_uuid);
+             Box::new([0u8; 0])
+         }
+    };
+    /*let ta_binary: Box<[u8]> = match shim.get_ta_bin(&ta_uuid) {
          Some(bin) => bin,
          None => {
              debug_serial_println!("TA binary not found in UUID Map: {:?}", ta_uuid);
              Box::new([0u8; 0])
          }
-    };
+    };*/
     let loaded_program = Box::new(
         shim.load_ldelf(
             LDELF_BINARY,

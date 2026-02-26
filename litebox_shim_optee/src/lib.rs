@@ -1202,15 +1202,23 @@ impl TaHandleMap {
 }
 
 /// Entry in the TA UUID map containing binary data and parsed flags.
-struct TaInfo {
+pub struct TaInfo {
     /// The raw TA binary
     binary: alloc::boxed::Box<[u8]>,
     /// Parsed TA flags from .ta_head section
     flags: TaFlags,
 }
+use alloc::boxed::Box;
+
+/// Get the global TA UUID map singleton.
+pub fn ppk_ta_uuid_map() -> &'static TaUuidMap {
+    use once_cell::race::OnceBox;
+    static TA_UUID_MAP: OnceBox<TaUuidMap> = OnceBox::new();
+    TA_UUID_MAP.get_or_init(|| Box::new(TaUuidMap::new()))
+}
 
 /// Data structure to maintain a mapping from TA UUIDs to their binary data and flags.
-pub(crate) struct TaUuidMap {
+pub struct TaUuidMap {
     inner: spin::mutex::SpinMutex<HashMap<TeeUuid, TaInfo>>,
 }
 
@@ -1221,7 +1229,7 @@ impl TaUuidMap {
         }
     }
 
-    pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: alloc::boxed::Box<[u8]>) -> bool {
+    pub fn insert(&self, uuid: TeeUuid, ta_bin: alloc::boxed::Box<[u8]>) -> bool {
         // Parse TA head from the binary's .ta_head section
         let Some(ta_head) = litebox_common_optee::parse_ta_head(&ta_bin) else {
             litebox::log_println!(
@@ -1251,7 +1259,7 @@ impl TaUuidMap {
         true
     }
 
-    pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+    pub fn get(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
         self.inner.lock().get(uuid).map(|info| info.binary.clone())
     }
 
