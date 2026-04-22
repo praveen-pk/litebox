@@ -1975,6 +1975,46 @@ impl OpteeRpcArgs {
         }
     }
 
+    pub fn set_param_attr_type(
+        &mut self,
+        index: usize,
+        attr_type: OpteeMsgAttrType,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            let current_attr = self.params[index].attr;
+            let new_attr = OpteeMsgAttr((current_attr.0 & !0xff) | (attr_type as u64));
+            self.params[index].attr = new_attr;
+            Ok(())
+        }
+    }
+
+    pub fn set_param_rmem_size(
+        &mut self,
+        index: usize,
+        size: u64,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            // rmem.size is at byte offset 8 in the 24-byte data, the same position as value.b in the original union.
+            self.params[index].data[8..16].copy_from_slice(&size.to_le_bytes());
+            Ok(())
+        }
+    }
+    pub fn set_param_rmem(
+        &mut self,
+        index: usize,
+        rmem: OpteeMsgParamRmem,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].data.copy_from_slice(rmem.as_bytes());
+            Ok(())
+        }
+    }
     // Note: RPC does not use rmem params. Rmem requires pre-registered shared memory
     // references from the normal-world driver, which is a main-messaging-path concept.
     // RPC uses tmem for buffer references since OP-TEE provides physical addresses directly.
@@ -2064,6 +2104,7 @@ impl OpteeSmcArgs {
     pub fn set_return_code(&mut self, code: OpteeSmcReturnCode) {
         self.args[0] = code as usize;
     }
+
 }
 
 /// `OPTEE_SMC_FUNCID_*` from `core/arch/arm/include/sm/optee_smc.h`
