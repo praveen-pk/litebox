@@ -23,10 +23,10 @@ use litebox::{mm::linux::PAGE_SIZE, utils::TruncateExt};
 use litebox_common_linux::vmap::{PhysPageAddr, PhysPointerError};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeMsgAttrType, OpteeMsgParamRmem,
-    OpteeMsgParamTmem, OpteeMsgParamValue, OpteeRpcArgs, OpteeSecureWorldCapabilities,
-    OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturnCode, TeeIdentity, TeeLogin,
-    TeeOrigin, TeeParamType, TeeResult, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
-    optee_msg_args_total_size,
+    OpteeMsgParamTmem, OpteeMsgParamValue, OpteeRpcArgs, OpteeRpcCommand,
+    OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult,
+    OpteeSmcReturnCode, TeeIdentity, TeeLogin, TeeOrigin, TeeParamType, TeeResult, TeeUuid,
+    UteeEntryFunc, UteeParamOwned, UteeParams, optee_msg_args_total_size,
 };
 use once_cell::race::OnceBox;
 use zerocopy::{FromBytes, Immutable};
@@ -170,6 +170,7 @@ pub fn read_optee_msg_args_from_phys(
     parse_optee_msg_args(&blob, has_rpc_arg)
 }
 
+
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
 /// It returns an `OpteeSmcResult` representing the result of the SMC call or `OpteeMsgArgs` it contains
 /// if the SMC call involves with an OP-TEE message which should be handled by
@@ -285,6 +286,57 @@ pub fn handle_optee_smc_args(
         }),
         _ => Err(OpteeSmcReturnCode::UnknownFunction),
     }
+}
+
+/// Prepare a LOAD_TA RPC request to be sent to normal world (VTL0).
+///
+/// This function writes a LOAD_TA RPC request into the RPC args buffer at the given
+/// physical address. The normal world driver (via tee-supplicant) will load the TA
+/// binary into shared memory and return it via the output parameter.
+///
+/// # Parameters
+///
+/// * `rpc_args_phys_addr` - Physical address where the RPC args struct resides in VTL0
+/// * `ta_uuid` - The UUID of the TA to load
+///
+/// # RPC Protocol
+///
+/// The LOAD_TA RPC uses 2 parameters:
+/// - param[0]: ValueInput containing the TA UUID (two u64 values)
+/// - param[1]: RmemOutput for the TA binary (size=0 initially, tee-supplicant allocates)
+///
+/// # Returns
+///
+/// `Ok(())` on success, or an error code if the RPC args cannot be written.
+pub fn prepare_load_ta_rpc(
+    rpc_msg_args: &mut OpteeRpcArgs,
+    ta_uuid: OpteeMsgParamValue,
+    memref_size: u64,
+    memref: Option<OpteeMsgParamRmem>
+) -> Result<(), OpteeSmcReturnCode> {
+    // Set up the RPC command for LOAD_TA
+    // Note: RPC uses the same wire format as OpteeMsgArgs, but cmd field contains RPC command IDs.
+    rpc_msg_args.cmd = OpteeRpcCommand::LoadTa;
+    rpc_msg_args.num_params = 2;
+
+    // param[0]: ValueInput with TA UUID
+    rpc_msg_args
+        .set_param_attr_type(0, OpteeMsgAttrType::ValueInput)
+        .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+
+    rpc_msg_args.set_param_value(0, ta_uuid)?;
+
+    // param[1]: RmemOutput for receiving the TA binary (empty memref initially)
+    rpc_msg_args
+        .set_param_attr_type(1, OpteeMsgAttrType::RmemOutput)
+        .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+
+    rpc_msg_args.set_param_rmem_size(1, memref_size)?;
+    if let Some(rmem) = memref {
+        rpc_msg_args.set_param_rmem(1, rmem)?;
+    }
+
+    Ok(())
 }
 
 /// This function handles an OP-TEE message contained in `OpteeMsgArgs`.

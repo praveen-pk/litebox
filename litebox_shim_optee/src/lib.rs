@@ -8,7 +8,7 @@
 
 extern crate alloc;
 
-use crate::loader::elf::ElfLoaderError;
+pub use crate::loader::elf::ElfLoaderError;
 use aes::{Aes128, Aes192, Aes256};
 use alloc::{sync::Arc, vec};
 use core::cell::Cell;
@@ -248,10 +248,14 @@ impl OpteeShim {
                 tls_base_addr: Cell::new(0),
             },
         };
-        if let Some(ta_bin) = ta_bin
-            && !entrypoints.task.global.store_ta_bin(&ta_uuid, ta_bin)
-        {
-            return Err(loader::elf::ElfLoaderError::InvalidUuid);
+
+        if let Some(ta_bin) = ta_bin {
+            if ta_bin.is_empty() {
+                return Err(loader::elf::ElfLoaderError::ElfNotFound);
+            }
+            if !entrypoints.task.global.store_ta_bin(&ta_uuid, ta_bin) {
+                return Err(loader::elf::ElfLoaderError::InvalidUuid);
+            }
         }
         let elf_loader = loader::elf::ElfLoader::new(&entrypoints.task, ldelf_bin, true)?;
         entrypoints.task.load_ldelf(elf_loader, ta_uuid)?;
