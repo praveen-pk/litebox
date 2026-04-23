@@ -67,7 +67,7 @@ const MAX_SHM_MEMREF_SIZE: usize = 8 * 1024 * 1024;
 const MAX_SHM_REF_MAP_ENTRIES: usize = 1024;
 
 #[inline]
-fn page_align_down(address: u64) -> u64 {
+pub fn page_align_down(address: u64) -> u64 {
     address & !(PAGE_SIZE as u64 - 1)
 }
 
@@ -826,7 +826,7 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
 /// This data structure is for registering shared memory regions before they are
 /// used during OP-TEE calls with parameters referencing shared memory.
 /// Any normal memory references without this registration will be rejected.
-struct ShmRefMap<const ALIGN: usize> {
+pub struct ShmRefMap<const ALIGN: usize> {
     inner: spin::mutex::SpinMutex<HashMap<u64, ShmInfo<ALIGN>>>,
 }
 
@@ -930,7 +930,7 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
     }
 }
 
-fn shm_ref_map() -> &'static ShmRefMap<PAGE_SIZE> {
+pub fn shm_ref_map() -> &'static ShmRefMap<PAGE_SIZE> {
     static SHM_REF_MAP: OnceBox<ShmRefMap<PAGE_SIZE>> = OnceBox::new();
     SHM_REF_MAP.get_or_init(|| Box::new(ShmRefMap::new()))
 }
@@ -1013,4 +1013,40 @@ fn get_shm_info_from_optee_msg_param_rmem(
         start % PAGE_SIZE,
         rmem.size.trunc(),
     )
+}
+
+/// Read data from the normal world shared memory pages whose physical addresses are given in
+/// `shm_info` into `buffer`. The size of `buffer` indicates the number of bytes to read.
+pub fn read_data_from_shm<const ALIGN: usize>(
+    shm_info: &ShmInfo<ALIGN>,
+    buffer: &mut [u8],
+) -> Result<(), OpteeSmcReturnCode> {
+    read_data_from_shm_with_offset(shm_info, 0, buffer)
+}
+
+fn read_data_from_shm_with_offset<const ALIGN: usize>(
+    shm_info: &ShmInfo<ALIGN>,
+    offset: usize,
+    buffer: &mut [u8],
+) -> Result<(), OpteeSmcReturnCode> {
+    let mut ptr: NormalWorldConstPtr<u8, ALIGN> = shm_info.clone().try_into()?;
+    // SAFETY: The data is copied into a buffer owned by LiteBox to avoid TOCTOU issues.
+    unsafe {
+        ptr.read_slice_at_offset(offset, buffer)?;
+    }
+    Ok(())
+}
+
+/// Write data in `buffer` to the normal world shared memory pages whose physical addresses are given
+/// in `shm_info`. The size of `buffer` indicates the number of bytes to write.
+fn write_data_to_shm<const ALIGN: usize>(
+    shm_info: &ShmInfo<ALIGN>,
+    buffer: &[u8],
+) -> Result<(), OpteeSmcReturnCode> {
+    let mut ptr: NormalWorldMutPtr<u8, ALIGN> = shm_info.clone().try_into()?;
+    // SAFETY: The data is written from a buffer owned by LiteBox.
+    unsafe {
+        ptr.write_slice_at_offset(0, buffer)?;
+    }
+    Ok(())
 }
