@@ -23,7 +23,7 @@ use litebox::{mm::linux::PAGE_SIZE, utils::TruncateExt};
 use litebox_common_linux::vmap::{PhysPageAddr, PhysPointerError};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeMsgAttrType, OpteeMsgParamRmem,
-    OpteeMsgParamTmem, OpteeMsgParamValue, OpteeRpcArgs, OpteeRpcCommand,
+    OpteeMsgParamTmem, OpteeMsgParamValue, OpteeRpcArgs, OpteeRpcCommand, OpteeRpcShmType,
     OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult,
     OpteeSmcReturnCode, TeeIdentity, TeeLogin, TeeOrigin, TeeParamType, TeeResult, TeeUuid,
     UteeEntryFunc, UteeParamOwned, UteeParams, optee_msg_args_total_size,
@@ -170,7 +170,6 @@ pub fn read_optee_msg_args_from_phys(
     parse_optee_msg_args(&blob, has_rpc_arg)
 }
 
-
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
 /// It returns an `OpteeSmcResult` representing the result of the SMC call or `OpteeMsgArgs` it contains
 /// if the SMC call involves with an OP-TEE message which should be handled by
@@ -234,6 +233,17 @@ pub fn handle_optee_smc_args(
             let msg_args_addr = shm_info.page_addrs[page_index].as_usize() + offset_in_page;
 
             Ok(OpteeSmcResult::CallWithArg {
+                msg_args,
+                rpc_args,
+                msg_args_phys_addr: msg_args_addr as u64,
+            })
+        }
+        OpteeSmcFunction::ReturnFromRpc => {
+            let msg_args_addr = smc.optee_msg_args_phys_addr()?;
+            let msg_args_addr: usize = msg_args_addr.truncate();
+            let (msg_args, rpc_args) = read_optee_msg_args_from_phys(msg_args_addr, true)?;
+            let rpc_args = rpc_args.ok_or(OpteeSmcReturnCode::EBadAddr)?;
+            Ok(OpteeSmcResult::ReturnFromRpc {
                 msg_args,
                 rpc_args,
                 msg_args_phys_addr: msg_args_addr as u64,
@@ -312,7 +322,7 @@ pub fn prepare_load_ta_rpc(
     rpc_msg_args: &mut OpteeRpcArgs,
     ta_uuid: OpteeMsgParamValue,
     memref_size: u64,
-    memref: Option<OpteeMsgParamRmem>
+    memref: Option<OpteeMsgParamRmem>,
 ) -> Result<(), OpteeSmcReturnCode> {
     // Set up the RPC command for LOAD_TA
     // Note: RPC uses the same wire format as OpteeMsgArgs, but cmd field contains RPC command IDs.
@@ -335,6 +345,39 @@ pub fn prepare_load_ta_rpc(
     if let Some(rmem) = memref {
         rpc_msg_args.set_param_rmem(1, rmem)?;
     }
+
+    Ok(())
+}
+
+/// Prepare an SHM_ALLOC RPC request to ask the normal world to allocate shared memory.
+///
+/// # Parameters
+///
+/// * `rpc_msg_args` - The RPC args buffer to write into
+/// * `shm_type` - The shared memory type (Appl, Kernel, or Global)
+/// * `size` - The size of the buffer to allocate
+/// * `alignment` - The required alignment for the allocated buffer
+pub fn prepare_shm_alloc_rpc(
+    rpc_msg_args: &mut OpteeRpcArgs,
+    shm_type: OpteeRpcShmType,
+    size: u64,
+    alignment: u64,
+) -> Result<(), OpteeSmcReturnCode> {
+    rpc_msg_args.cmd = OpteeRpcCommand::ShmAlloc;
+    rpc_msg_args.num_params = 1;
+
+    rpc_msg_args
+        .set_param_attr_type(0, OpteeMsgAttrType::ValueInput)
+        .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+
+    rpc_msg_args.set_param_value(
+        0,
+        OpteeMsgParamValue {
+            a: shm_type as u64,
+            b: size,
+            c: alignment,
+        },
+    )?;
 
     Ok(())
 }
