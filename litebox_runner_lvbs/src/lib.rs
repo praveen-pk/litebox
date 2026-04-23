@@ -16,7 +16,7 @@ use litebox::{
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeRpcShmType, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, TeeUuid, UteeEntryFunc, UteeParams, optee_msg_args_total_size
+    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgParamRmem, OpteeRpcArgs, OpteeRpcCommand, OpteeRpcShmType, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, TeeUuid, UteeEntryFunc, UteeParams, optee_msg_args_total_size
 };
 use litebox_platform_lvbs::{
     arch::{gdt, instrs::hlt_loop, interrupts},
@@ -41,8 +41,9 @@ use litebox_platform_lvbs::{
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::ElfLoaderError;
 use litebox_shim_optee::msg_handler::{
-    decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, prepare_load_ta_rpc,
-    prepare_shm_alloc_rpc, update_optee_msg_args,
+    decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, page_align_down,
+    page_align_up, prepare_load_ta_rpc, prepare_shm_alloc_rpc, read_data_from_shm, shm_ref_map,
+    update_optee_msg_args,
 };
 use litebox_shim_optee::session::{
     CreationReservation, SessionIdGuard, SessionManager, TaInstance, allocate_session_id,
@@ -480,29 +481,158 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
         } => {
             debug_serial_println!("ReturnFromRpc Command: {:?}", rpc_args.cmd);
             let mut rpc_args = *rpc_args;
-            let buf_size = rpc_args.get_param_rmem_size(1).unwrap_or(0);
-            if buf_size == 0 {
-                debug_serial_println!("Invalid buffer size in ReturnFromRpc");
-                smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
-                return *smc_args;
+            // rpc_args.cmd is preserved when VTL0 responds to an RPC request.
+            // Use it to determine which RPC command this response is for, and handle accordingly.
+            match rpc_args.cmd {
+                OpteeRpcCommand::LoadTa => {
+                    handle_return_from_load_ta_rpc(
+                        &mut smc_args,
+                        &msg_args,
+                        &mut rpc_args,
+                        msg_args_phys_addr,
+                    );
+                }
+                OpteeRpcCommand::ShmAlloc => {
+                    handle_return_from_shm_alloc_rpc(
+                        &mut smc_args,
+                        &msg_args,
+                        &mut rpc_args,
+                        msg_args_phys_addr,
+                    );
+                }
+                _ => {
+                    debug_serial_println!("Return from unknown RPC command: {:?}", rpc_args.cmd);
+                    smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                    return *smc_args;
+                }
             }
-            // Request VTL0 to allocate a SHM buffer for the TA binary
-            if let Err(e) = prepare_shm_alloc_rpc(
-                &mut rpc_args,
-                OpteeRpcShmType::Appl,
-                buf_size,
-                8, // 8-byte alignment required by OP-TEE SMC calls
-            ) {
-                debug_serial_println!("Failed to prepare SHM_ALLOC RPC: {:?}", e);
-                smc_args.set_return_code(e);
-                return *smc_args;
-            }
-            let _ = write_rpc_args_to_normal_world(&msg_args, msg_args_phys_addr, &rpc_args);
-            smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
-            return *smc_args;
+            *smc_args
         }
         other => other.into(),
     }
+}
+
+/// Handle the return from a LOAD_TA RPC.
+///
+/// Two sub-cases based on the rmem param at index 1:
+/// 1. rmem.shm_ref != 0 → TA binary is available in shared memory. Read it.
+/// 2. rmem.shm_ref == 0 → VTL0 only returned the size. Send SHM_ALLOC to allocate a buffer.
+fn handle_return_from_load_ta_rpc(
+    smc_args: &mut OpteeSmcArgs,
+    msg_args: &OpteeMsgArgs,
+    rpc_args: &mut OpteeRpcArgs,
+    msg_args_phys_addr: u64,
+) {
+    let Ok(rmem) = rpc_args.get_param_rmem(1) else {
+        debug_serial_println!("Failed to get RMEM param from LoadTa RPC response");
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    };
+
+    if rmem.shm_ref != 0 {
+        // TA binary is available in shared memory — read it
+        let Some(shm_info) = shm_ref_map().get(rmem.shm_ref) else {
+            debug_serial_println!("Failed to find SHM info for shm_ref: {:#x}", rmem.shm_ref);
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            return;
+        };
+        let ta_size: usize = rmem.size.truncate();
+        let mut ta_bin = alloc::vec![0u8; ta_size];
+        if let Err(e) = read_data_from_shm(&shm_info, &mut ta_bin) {
+            debug_serial_println!("Failed to read TA buffer from shared memory: {:?}", e);
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            return;
+        }
+        debug_serial_println!(
+            "Successfully read TA binary from shared memory, size: {}",
+            ta_bin.len()
+        );
+
+        // TODO: Store the TA binary for use during OpenSession
+        // Temporarily return BadCmd here
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    }
+
+    // VTL0 only returned the size — send SHM_ALLOC to allocate a buffer
+    if rmem.size == 0 {
+        debug_serial_println!("Invalid buffer size in ReturnFromRpc (LoadTa)");
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    }
+    debug_serial_println!(
+        "No RMEM returned from LoadTa RPC, sending SHM_ALLOC request with size: {}",
+        rmem.size
+    );
+    if let Err(e) = prepare_shm_alloc_rpc(
+        rpc_args,
+        OpteeRpcShmType::Appl,
+        rmem.size,
+        8, // 8-byte alignment required by OP-TEE SMC calls
+    ) {
+        debug_serial_println!("Failed to prepare SHM_ALLOC RPC: {:?}", e);
+        smc_args.set_return_code(e);
+        return;
+    }
+    let _ = write_rpc_args_to_normal_world(msg_args, msg_args_phys_addr, rpc_args);
+    smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
+}
+
+/// Handle the return from a SHM_ALLOC RPC.
+///
+/// VTL0 allocated a TMEM buffer. Register it in the SHM ref map, then send
+/// the final LOAD_TA RPC with the buffer so VTL0 can write the TA binary into it.
+fn handle_return_from_shm_alloc_rpc(
+    smc_args: &mut OpteeSmcArgs,
+    msg_args: &OpteeMsgArgs,
+    rpc_args: &mut OpteeRpcArgs,
+    msg_args_phys_addr: u64,
+) {
+    let Ok(tmem) = rpc_args.get_param_tmem(0) else {
+        debug_serial_println!("Failed to get TMEM param from SHM_ALLOC RPC");
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    };
+    if tmem.buf_ptr == 0 || tmem.size == 0 || tmem.shm_ref == 0 {
+        debug_serial_println!("Invalid buffer info received from SHM_ALLOC");
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    }
+
+    // Register the TMEM buffer in the SHM ref map
+    let tmem_phys_addr = page_align_down(tmem.buf_ptr);
+    let page_offset = (tmem.buf_ptr - tmem_phys_addr) as usize;
+    let aligned_size = page_align_up((page_offset as u64) + tmem.size);
+    if let Err(e) = shm_ref_map().register_shm(
+        tmem_phys_addr,
+        page_offset as u64,
+        aligned_size,
+        tmem.shm_ref,
+    ) {
+        debug_serial_println!("Failed to register TMEM from SHM_ALLOC: {:?}", e);
+        smc_args.set_return_code(e);
+        return;
+    }
+
+    // Send the final LOAD_TA request with the allocated buffer
+    debug_serial_println!("Sending final LOAD_TA request with allocated buffer");
+    let Ok(uuid) = msg_args.get_param_value(0) else {
+        debug_serial_println!("Failed to get UUID from msg_args");
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    };
+    let rmem = OpteeMsgParamRmem {
+        offs: page_offset as u64,
+        size: tmem.size,
+        shm_ref: tmem.shm_ref,
+    };
+    if let Err(e) = prepare_load_ta_rpc(rpc_args, uuid, tmem.size, Some(rmem)) {
+        debug_serial_println!("Failed to prepare final LOAD_TA RPC: {:?}", e);
+        smc_args.set_return_code(e);
+        return;
+    }
+    let _ = write_rpc_args_to_normal_world(msg_args, msg_args_phys_addr, rpc_args);
+    smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
 }
 
 /// Handle OpenSession command.

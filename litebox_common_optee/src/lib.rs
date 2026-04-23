@@ -2029,6 +2029,17 @@ impl OpteeRpcArgs {
         }
     }
 
+    /// Access an rmem parameter by index with bounds checking against `num_params`.
+    pub fn get_param_rmem(&self, index: usize) -> Result<OpteeMsgParamRmem, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index]
+                .get_param_rmem()
+                .ok_or(OpteeSmcReturnCode::EBadCmd)
+        }
+    }
+
     pub fn set_param_rmem(
         &mut self,
         index: usize,
@@ -2041,9 +2052,6 @@ impl OpteeRpcArgs {
             Ok(())
         }
     }
-    // Note: RPC does not use rmem params. Rmem requires pre-registered shared memory
-    // references from the normal-world driver, which is a main-messaging-path concept.
-    // RPC uses tmem for buffer references since OP-TEE provides physical addresses directly.
 }
 
 /// Serialize the params portion as raw bytes into `buf`.
