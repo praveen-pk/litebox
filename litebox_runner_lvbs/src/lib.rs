@@ -532,7 +532,7 @@ fn handle_return_from_load_ta_rpc(
         // TA binary is available in shared memory — read it
         let Some(shm_info) = shm_ref_map().get(rmem.shm_ref) else {
             debug_serial_println!("Failed to find SHM info for shm_ref: {:#x}", rmem.shm_ref);
-            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadAddr);
             return;
         };
         let ta_size: usize = rmem.size.truncate();
@@ -547,9 +547,21 @@ fn handle_return_from_load_ta_rpc(
             ta_bin.len()
         );
 
-        // TODO: Store the TA binary for use during OpenSession
-        // Temporarily return BadCmd here
-        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        // Extract UUID from the original msg_args and store the TA binary
+        let Ok(uuid_param) = msg_args.get_param_value(0) else {
+            debug_serial_println!("Failed to get UUID param from msg_args");
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            return;
+        };
+        let ta_uuid = litebox_common_optee::TeeUuid::from_u64_array([uuid_param.a, uuid_param.b]);
+        let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
+        if !shim.store_ta_bin(&ta_uuid, &ta_bin) {
+            debug_serial_println!("Failed to store TA binary for UUID: {:?}", ta_uuid);
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            return;
+        }
+        debug_serial_println!("TA binary stored successfully for UUID: {:?}", ta_uuid);
+        smc_args.set_return_code(OpteeSmcReturnCode::Ok);
         return;
     }
 
@@ -614,7 +626,7 @@ fn handle_return_from_shm_alloc_rpc(
     }
 
     // Send the final LOAD_TA request with the allocated buffer
-    debug_serial_println!("Sending final LOAD_TA request with allocated buffer");
+    debug_serial_println!("Send final LOAD_TA request with allocated buffer");
     let Ok(uuid) = msg_args.get_param_value(0) else {
         debug_serial_println!("Failed to get UUID from msg_args");
         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
@@ -928,11 +940,14 @@ fn open_session_new_instance(
 
     // Load ldelf and TA - Box immediately to keep at fixed heap address
     let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
+    let ta_binary = shim
+        .get_ta_bin(&ta_uuid)
+        .unwrap_or_else(|| alloc::boxed::Box::new([0u8; 0]));
     let loaded_program = Box::new(
         shim.load_ldelf(
             LDELF_BINARY,
             ta_uuid,
-            Some(TA_BINARY),
+            Some(&ta_binary),
             client_identity,
             runner_session_id,
         )

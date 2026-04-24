@@ -144,7 +144,6 @@ impl OpteeShimBuilder {
             platform: self.platform,
             pm: PageManager::new(&self.litebox),
             _litebox: self.litebox,
-            ta_uuid_map: TaUuidMap::new(),
         });
         OpteeShim(global)
     }
@@ -158,8 +157,6 @@ struct GlobalState {
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The LiteBox instance used throughout the shim.
     _litebox: litebox::LiteBox<Platform>,
-    /// The TA UUID to binary map for TA loading.
-    ta_uuid_map: TaUuidMap,
 }
 
 impl GlobalState {
@@ -168,12 +165,12 @@ impl GlobalState {
     /// Returns `true` if the binary was successfully stored, `false` if the binary's
     /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
     pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
-        self.ta_uuid_map.insert(*ta_uuid, ta_bin.into())
+        ta_uuid_map().insert(*ta_uuid, ta_bin.into())
     }
 
     /// Get the TA binary associated with the given TA UUID.
     pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
-        if let Some(ta_bin) = self.ta_uuid_map.get(ta_uuid) {
+        if let Some(ta_bin) = ta_uuid_map().get(ta_uuid) {
             Some(ta_bin)
         } else {
             let ta_bin = Self::rpc_get_ta_bin(ta_uuid)?;
@@ -186,7 +183,7 @@ impl GlobalState {
 
     /// Get the TA flags associated with the given TA UUID.
     pub(crate) fn get_ta_flags(&self, ta_uuid: &TeeUuid) -> TaFlags {
-        self.ta_uuid_map.get_flags(ta_uuid).unwrap_or_default()
+        ta_uuid_map().get_flags(ta_uuid).unwrap_or_default()
     }
 
     /// Remove the TA binary associated with the given TA UUID.
@@ -199,7 +196,7 @@ impl GlobalState {
     /// this TA binary
     #[expect(dead_code)]
     pub(crate) fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
-        let _ = self.ta_uuid_map.remove(ta_uuid);
+        let _ = ta_uuid_map().remove(ta_uuid);
     }
 
     /// RPC to get the TA binary associated with the given TA UUID. Placeholder for now.
@@ -283,6 +280,19 @@ impl OpteeShim {
     /// Get the global page manager
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
         &self.0.pm
+    }
+
+    /// Store a TA binary associated with the given TA UUID.
+    ///
+    /// Returns `true` if the binary was successfully stored, `false` if the binary's
+    /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
+    pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
+        self.0.store_ta_bin(ta_uuid, ta_bin)
+    }
+
+    /// Get the TA binary associated with the given TA UUID.
+    pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+        self.0.get_ta_bin(ta_uuid)
     }
 
     /// Release all user-space memory mappings owned by this shim instance.
@@ -1236,11 +1246,19 @@ impl TaUuidMap {
     pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: alloc::boxed::Box<[u8]>) -> bool {
         // Parse TA head from the binary's .ta_head section
         let Some(ta_head) = litebox_common_optee::parse_ta_head(&ta_bin) else {
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "Failed to parse .ta_head for TA UUID"
+            );
             return false;
         };
 
         // Verify that the TA binary's UUID matches the expected UUID
         if ta_head.uuid != uuid {
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "TA UUID mismatch for TA binary"
+            );
             return false;
         }
 
@@ -1268,6 +1286,12 @@ impl TaUuidMap {
     pub(crate) fn remove(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
         self.inner.lock().remove(uuid).map(|info| info.binary)
     }
+}
+
+/// Get the global TA UUID map.
+fn ta_uuid_map() -> &'static TaUuidMap {
+    static TA_UUID_MAP: once_cell::race::OnceBox<TaUuidMap> = once_cell::race::OnceBox::new();
+    TA_UUID_MAP.get_or_init(|| alloc::boxed::Box::new(TaUuidMap::new()))
 }
 
 /// TA/session-related information for the current task
