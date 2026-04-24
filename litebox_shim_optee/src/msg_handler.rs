@@ -336,9 +336,16 @@ pub fn prepare_load_ta_rpc(
 
     rpc_msg_args.set_param_value(0, ta_uuid)?;
 
-    // param[1]: RmemOutput for receiving the TA binary (empty memref initially)
+    // param[1]: Rmem for the TA binary
+    // RmemOutput when no buffer allocated yet (initial request),
+    // RmemInput when buffer is pre-allocated (after SHM_ALLOC)
+    let rmem_attr = if memref.is_some() {
+        OpteeMsgAttrType::RmemInput
+    } else {
+        OpteeMsgAttrType::RmemOutput
+    };
     rpc_msg_args
-        .set_param_attr_type(1, OpteeMsgAttrType::RmemOutput)
+        .set_param_attr_type(1, rmem_attr)
         .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
 
     rpc_msg_args.set_param_rmem_size(1, memref_size)?;
@@ -858,7 +865,7 @@ fn get_shm_info_from_optee_msg_param_tmem(
 ///
 /// `rmem.offs` must be an offset within the shared memory region registered with `rmem.shm_ref` before
 /// and `rmem.offs + rmem.size` must not exceed the size of the registered shared memory region.
-fn get_shm_info_from_optee_msg_param_rmem(
+pub fn get_shm_info_from_optee_msg_param_rmem(
     rmem: OpteeMsgParamRmem,
 ) -> Result<ShmInfo<PAGE_SIZE>, OpteeSmcReturnCode> {
     let Some(shm_info) = shm_ref_map().get(rmem.shm_ref) else {
