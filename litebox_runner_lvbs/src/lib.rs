@@ -646,6 +646,27 @@ fn handle_return_from_shm_alloc_rpc(
     smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
 }
 
+use core::arch::asm;
+
+/// Walk the call stack via frame pointer chain (requires `-C force-frame-pointers=yes`).
+unsafe fn print_backtrace() {
+    let mut rbp: usize;
+    asm!("mov {}, rbp", out(reg) rbp);
+
+    let mut frame = 0;
+    while rbp != 0 {
+        // Return address is at rbp + 8
+        let rip = *((rbp + 8) as *const usize);
+        if rip == 0 {
+            break;
+        }
+        // Use your serial/log macro here
+        log::info!("  frame {}: rip = {:#x}", frame, rip);
+        // Previous frame pointer is at *rbp
+        rbp = *(rbp as *const usize);
+        frame += 1;
+    }
+}
 /// Handle OpenSession command.
 ///
 /// For multi-instance TAs, creates a new task page table and loads ldelf/TA into it.
@@ -689,7 +710,10 @@ fn handle_open_session(
             );
         }
     }
-
+    debug_serial_println!("Call Stack for TA UUID {:?}:", ta_uuid);
+    unsafe {
+        print_backtrace();
+    }
     // TODO: Add support for Load LDELF_BINARY via RPC , immediate focus is on TA.
     // If neither binary is baked in, issue an RPC to VTL0 to fetch the TA
     // before entering the creation slot.
