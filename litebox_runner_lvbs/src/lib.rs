@@ -16,8 +16,7 @@ use litebox::{
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeRpcShmType, OpteeSmcArgs, OpteeSmcResult,
-    OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
+    OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeRpcShmType, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, TeeUuid, UteeEntryFunc, UteeParams, optee_msg_args_total_size
 };
 use litebox_platform_lvbs::{
     arch::{gdt, instrs::hlt_loop, interrupts},
@@ -273,6 +272,7 @@ fn optee_smc_handler_entry_inner(
     // SAFETY: The SMC args are written back to normal world memory.
     unsafe { smc_args_ptr.write_at_offset(0, smc_args_updated) }
         .map_err(|_| litebox_common_linux::errno::Errno::EFAULT)?;
+    debug_serial_println!("Returning from optee_smc_handler");
     Ok(0)
 }
 
@@ -458,6 +458,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                     let rpc_args_ref = rpc_args.as_ref().unwrap();
                     let _ =
                         write_rpc_args_to_normal_world(&msg_args, msg_args_phys_addr, rpc_args_ref);
+                    debug_serial_println!("RPC command issued, returning to normal world for handling");
                     smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
                 } else {
                     smc_args.set_return_code(e);
@@ -469,14 +470,15 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
             // Always switch back to base page table before returning to VTL0
             // Safety: No user-space memory references are held after this point
             unsafe { switch_to_base_page_table() };
-
-            *smc_args
+            debug_serial_println!("Returning from optee_smc_handler");
+            return *smc_args
         }
         OpteeSmcResult::ReturnFromRpc {
             msg_args,
             rpc_args,
             msg_args_phys_addr,
         } => {
+            debug_serial_println!("ReturnFromRpc Command: {:?}", rpc_args.cmd);
             let mut rpc_args = *rpc_args;
             let buf_size = rpc_args.get_param_rmem_size(1).unwrap_or(0);
             if buf_size == 0 {
@@ -497,7 +499,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
             }
             let _ = write_rpc_args_to_normal_world(&msg_args, msg_args_phys_addr, &rpc_args);
             smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
-            *smc_args
+            return *smc_args;
         }
         other => other.into(),
     }
@@ -521,10 +523,10 @@ fn handle_open_session(
     if ta_req_info.entry_func != UteeEntryFunc::OpenSession {
         return Err(OpteeSmcReturnCode::EBadCmd);
     }
-
     let ta_uuid = ta_req_info.uuid.ok_or(OpteeSmcReturnCode::EBadCmd)?;
     let client_identity = ta_req_info.client_identity;
     let params = &ta_req_info.params;
+    debug_serial_println!("handle_open_session1: OpenSession decoded TA UUID: :{:?}", ta_uuid);
 
     // Look up cached TA flags to determine single vs multi-instance.
     // For the first-ever load of a UUID (no cached flags), conservatively
@@ -547,22 +549,40 @@ fn handle_open_session(
         }
     }
 
+    debug_serial_println!("handle_open_session2: Single-instance check complete, proceeding to creation slot if needed");
     // TODO: Add support for Load LDELF_BINARY via RPC , immediate focus is on TA.
     // If neither binary is baked in, issue an RPC to VTL0 to fetch the TA
     // before entering the creation slot.
-    if LDELF_BINARY.is_empty() || TA_BINARY.is_empty() {
-        let uuid = msg_args
-            .get_param_value(0)
-            .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
-        let rpc_args_mut = rpc_args.as_deref_mut().ok_or_else(|| {
-            debug_serial_println!("No RPC args provided for dynamic TA load: {:?}", ta_uuid);
-            OpteeSmcReturnCode::EBadCmd
-        })?;
-        prepare_load_ta_rpc(rpc_args_mut, uuid, 0, None)
-            .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
-        return Err(OpteeSmcReturnCode::RpcCmd);
+
+    // This is device.pta: 7011a688-ddde-4053-a5a9-7b3c4ddf13b8, which is not pre-baked into Litebox
+    if ta_uuid != (TeeUuid {
+    time_low: 0x7011a688,
+    time_mid: 0xddde,
+    time_hi_and_version: 0x4053,
+    clock_seq_and_node: [0xa5, 0xa9, 0x7b, 0x3c, 0x4d, 0xdf, 0x13, 0xb8],
+    }) {
+        if LDELF_BINARY.is_empty() || TA_BINARY.is_empty() {
+            if rpc_args.is_none() {
+                debug_serial_println!("handle_open_session3: RPC args not provided but needed to load TA dynamically: {:?}", ta_uuid);
+                return Err(OpteeSmcReturnCode::EBadCmd);
+            }
+            let uuid = msg_args
+                .get_param_value(0)
+                .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+            debug_serial_println!("handle_open_session3: LDELF or TA binary missing, issuing RPC to load TA: {:?}", uuid);
+            let rpc_args_mut = rpc_args.as_deref_mut().ok_or_else(|| {
+                debug_serial_println!("No RPC args provided for dynamic TA load: {:?}", ta_uuid);
+                OpteeSmcReturnCode::EBadCmd
+            })?;
+            debug_serial_println!("handle_open_session3: Preparing RPC to load TA: {:?}", uuid);
+
+            prepare_load_ta_rpc(rpc_args_mut, uuid, 0, None)
+                .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+            return Err(OpteeSmcReturnCode::RpcCmd);
+        }
     }
 
+    debug_serial_println!("handle_open_session4: LDELF and TA binary present, proceeding to creation slot");
     // Create a new TA instance. For single-instance TAs, this also re-checks the cache
     // under the lock and prevents concurrent instance creation of the same UUID.
     // For multi-instance TAs, only the global capacity limit is enforced.
