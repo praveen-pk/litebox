@@ -530,10 +530,10 @@ fn handle_return_from_load_ta_rpc(
     debug_serial_println!(">3>: ReturnFromRpc LoadTa");
     // Try RMEM first
     let rmem_result = rpc_args.get_param_rmem(1);
-    let (rmem, used_tmem) = match rmem_result {
+    let rmem = match rmem_result {
         Ok(rmem) => {
             debug_serial_println!("Received RMEM param in LoadTA RPC response");
-            (rmem, false)
+            rmem
         },
         Err(_) => {
             debug_serial_println!("Failed to get RMEM param from LoadTa RPC response, trying TMEM");
@@ -541,12 +541,11 @@ fn handle_return_from_load_ta_rpc(
                 Ok(tmem) => {
                     debug_serial_println!("Received TMEM param in LoadTA RPC response (fallback)");
                     // Synthesize RMEM from TMEM fields for downstream logic
-                    let rmem = OpteeMsgParamRmem {
+                    OpteeMsgParamRmem {
                         shm_ref: tmem.shm_ref,
                         offs: 0, // TMEM doesn't have offset, so use 0
                         size: tmem.size,
-                    };
-                    (rmem, true)
+                    }
                 },
                 Err(_) => {
                     debug_serial_println!("Failed to get both RMEM and TMEM param from LoadTa RPC response");
@@ -732,7 +731,9 @@ fn handle_open_session(
     time_hi_and_version: 0x4053,
     clock_seq_and_node: [0xa5, 0xa9, 0x7b, 0x3c, 0x4d, 0xdf, 0x13, 0xb8],
     }) {
-        if LDELF_BINARY.is_empty() || TA_BINARY.is_empty() {
+        let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
+        let ta_missing_in_map = shim.get_ta_bin(&ta_uuid).is_none();
+        if LDELF_BINARY.is_empty() || ta_missing_in_map {
             if rpc_args.is_none() {
                 debug_serial_println!("handle_open_session3: RPC args not provided but needed to load TA dynamically: {:?}", ta_uuid);
                 return Err(OpteeSmcReturnCode::EBadCmd);
@@ -740,7 +741,7 @@ fn handle_open_session(
             let uuid = msg_args
                 .get_param_value(0)
                 .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
-            debug_serial_println!("handle_open_session3: LDELF or TA binary missing, issuing RPC to load TA: {:?}", uuid);
+            debug_serial_println!("handle_open_session3: LDELF missing or TA UUID not found in map, issuing RPC to load TA: {:?}", uuid);
             let rpc_args_mut = rpc_args.as_deref_mut().ok_or_else(|| {
                 debug_serial_println!("No RPC args provided for dynamic TA load: {:?}", ta_uuid);
                 OpteeSmcReturnCode::EBadCmd
@@ -1559,7 +1560,6 @@ fn write_rpc_args_to_normal_world(
 // use include_bytes! to include ldelf and (KMPP) TA binaries
 //const LDELF_BINARY: &[u8] = &[0u8; 0];
 const LDELF_BINARY: &[u8] = include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/ldelf.elf");
-const TA_BINARY: &[u8] = &[0u8; 0];
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
