@@ -666,10 +666,33 @@ fn handle_return_from_load_ta_rpc(
     rpc_args: &mut OpteeRpcArgs,
     msg_args_phys_addr: u64,
 ) {
-    let Ok(rmem) = rpc_args.get_param_rmem(1) else {
-        debug_serial_println!("Failed to get RMEM param from LoadTa RPC response");
-        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
-        return;
+    // Try RMEM first
+    let rmem_result = rpc_args.get_param_rmem(1);
+    let (rmem, _used_tmem) = match rmem_result {
+        Ok(rmem) => {
+            debug_serial_println!("Received RMEM param in LoadTA RPC response");
+            (rmem, false)
+        },
+        Err(_) => {
+            debug_serial_println!("Failed to get RMEM param from LoadTa RPC response, trying TMEM");
+            match rpc_args.get_param_tmem(1) {
+                Ok(tmem) => {
+                    debug_serial_println!("Received TMEM param in LoadTA RPC response (fallback)");
+                    // Synthesize RMEM from TMEM fields for downstream logic
+                    let rmem = OpteeMsgParamRmem {
+                        shm_ref: tmem.shm_ref,
+                        offs: 0, // TMEM doesn't have offset, so use 0
+                        size: tmem.size,
+                    };
+                    (rmem, true)
+                },
+                Err(_) => {
+                    debug_serial_println!("Failed to get both RMEM and TMEM param from LoadTa RPC response");
+                    smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                    return;
+                }
+            }
+        }
     };
 
     if rmem.shm_ref != 0 {
@@ -704,7 +727,7 @@ fn handle_return_from_load_ta_rpc(
         return;
     }
     debug_serial_println!(
-        "No RMEM returned from LoadTa RPC, sending SHM_ALLOC request with size: {}",
+        "No RMEM/TMEM returned from LoadTa RPC, sending SHM_ALLOC request with size: {}",
         rmem.size
     );
     if let Err(e) = prepare_shm_alloc_rpc(
@@ -732,6 +755,7 @@ fn handle_return_from_shm_alloc_rpc(
     rpc_args: &mut OpteeRpcArgs,
     msg_args_phys_addr: u64,
 ) {
+    debug_serial_println!("ReturnFromRpc SHM_ALLOC");
     let Ok(tmem) = rpc_args.get_param_tmem(0) else {
         debug_serial_println!("Failed to get TMEM param from SHM_ALLOC RPC");
         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
@@ -884,6 +908,7 @@ fn handle_open_session(
             Ok(())
         }
     })
+
 }
 
 /// Open a new session on an existing single-instance TA.
