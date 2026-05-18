@@ -64,6 +64,45 @@ pub fn page_align_up(len: u64) -> u64 {
     len.next_multiple_of(PAGE_SIZE as u64)
 }
 
+#[inline]
+fn is_virtual_address(addr: u64) -> bool {
+    // Bit 52..63 set indicates a virtual-style pointer, not a direct PA.
+    (addr >> 52) != 0
+}
+
+fn read_optee_msg_args_from_registered_shm(
+    shm_ref: u64,
+    offset: usize,
+) -> Result<(Box<OpteeMsgArgs>, Box<OpteeRpcArgs>, u64), OpteeSmcReturnCode> {
+    let shm_info = shm_ref_map()
+        .get(shm_ref)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+
+    // Compute copy size from known-good upper bounds — no untrusted data involved.
+    let main_max = optee_msg_args_total_size(OpteeMsgArgs::MAX_ARG_PARAM_COUNT.truncate());
+    let copy_size =
+        main_max + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.truncate());
+
+    let mut blob = alloc::vec![0u8; copy_size];
+    read_data_from_shm_with_offset(&shm_info, offset, &mut blob)?;
+    let (msg_args, rpc_args) = parse_optee_msg_args(&blob, true)?;
+    let rpc_args = rpc_args.ok_or(OpteeSmcReturnCode::EBadAddr)?;
+
+    // Compute the physical address of `OpteeMsgArgs`
+    let total_offset = shm_info
+        .page_offset
+        .checked_add(offset)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+    let page_index = total_offset / PAGE_SIZE;
+    let offset_in_page = total_offset % PAGE_SIZE;
+    if page_index >= shm_info.page_addrs.len() {
+        return Err(OpteeSmcReturnCode::EBadAddr);
+    }
+    let msg_args_addr = shm_info.page_addrs[page_index].as_usize() + offset_in_page;
+
+    Ok((msg_args, rpc_args, msg_args_addr as u64))
+}
+
 fn parse_optee_msg_args(
     blob: &[u8],
     has_rpc_arg: bool,
@@ -81,6 +120,8 @@ fn parse_optee_msg_args(
     let main_size = optee_msg_args_total_size(main_header.num_params);
     let main_params = &blob[size_of::<OpteeMsgArgsHeader>()..main_size];
     let main_args = OpteeMsgArgs::from_header_and_raw_params(&main_header, main_params)?;
+    let main_num_params = main_header.num_params as usize;
+    litebox_util_log::debug!("parse_optee_msg_args: main num_params: {main_num_params:?}");
 
     // Parse RPC args if present.
     // The Linux kernel driver places the RPC arg at offset main_size (based on the actual
@@ -95,13 +136,14 @@ fn parse_optee_msg_args(
         if rpc_header.num_params as usize > OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT {
             return Err(OpteeSmcReturnCode::EBadCmd);
         }
+        let rpc_num_params = rpc_header.num_params as usize;
+        litebox_util_log::debug!("parse_optee_msg_args: rpc_header.num_params: {rpc_num_params:?}");
         let rpc_params = &rpc_blob[size_of::<OpteeMsgArgsHeader>()..];
         let rpc = OpteeRpcArgs::from_header_and_raw_params(&rpc_header, rpc_params)?;
         Some(Box::new(rpc))
     } else {
         None
     };
-
     Ok((Box::new(main_args), rpc_args))
 }
 
@@ -151,6 +193,10 @@ pub fn read_optee_msg_args_from_phys(
     phys_addr: usize,
     has_rpc_arg: bool,
 ) -> Result<(Box<OpteeMsgArgs>, Option<Box<OpteeRpcArgs>>), OpteeSmcReturnCode> {
+    litebox_util_log::debug!(
+        phys_addr:? = phys_addr;
+        "******read_optee_msg_args_from_phys******"
+    );
     // Compute copy size from known-good upper bounds — no untrusted data involved.
     let main_max = optee_msg_args_total_size(OpteeMsgArgs::MAX_ARG_PARAM_COUNT.truncate());
     let copy_size = if has_rpc_arg {
@@ -166,6 +212,8 @@ pub fn read_optee_msg_args_from_phys(
             .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
     unsafe { blob_ptr.read_slice_at_offset(0, &mut blob) }
         .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+
+    litebox_util_log::debug!("read_optee_msg_args_from_phys->parse_optee_msg_args");
 
     parse_optee_msg_args(&blob, has_rpc_arg)
 }
@@ -187,6 +235,9 @@ pub fn handle_optee_smc_args(
         OpteeSmcFunction::CallWithArg => {
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
             let msg_args_addr: usize = msg_args_addr.truncate();
+            #[cfg(debug_assertions)]
+            litebox_util_log::debug!("handle_optee_smc_args: OpteeSmcFunction::CallWithArg, msg_args_addr: {msg_args_addr:#x}");
+
             let (msg_args, _) = read_optee_msg_args_from_phys(msg_args_addr, false)?;
             Ok(OpteeSmcResult::CallWithArg {
                 msg_args,
@@ -196,6 +247,8 @@ pub fn handle_optee_smc_args(
         }
         OpteeSmcFunction::CallWithRpcArg => {
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
+            #[cfg(debug_assertions)]
+            litebox_util_log::debug!("handle_optee_smc_args: OpteeSmcFunction::CallWithRpcArg, msg_args_addr: {msg_args_addr:#x}");
             let msg_args_addr: usize = msg_args_addr.truncate();
             let (msg_args, rpc_args) = read_optee_msg_args_from_phys(msg_args_addr, true)?;
             Ok(OpteeSmcResult::CallWithArg {
@@ -206,50 +259,48 @@ pub fn handle_optee_smc_args(
         }
         OpteeSmcFunction::CallWithRegdArg => {
             // `OpteeMsgArgs` is located at the offset specified in args[3] within the shared memory region pointed by args[1]:args[2].
+            litebox_util_log::debug!("handle_optee_smc_args: OpteeSmcFunction::CallWithRegdArg");
             let (shm_ref, offset) = smc.optee_regd_shm_ref_and_offset()?;
-            let shm_info = shm_ref_map()
-                .get(shm_ref)
-                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-
-            // Compute copy size from known-good upper bounds — no untrusted data involved.
-            let main_max = optee_msg_args_total_size(OpteeMsgArgs::MAX_ARG_PARAM_COUNT.truncate());
-            let copy_size = main_max
-                + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.truncate());
-
-            let mut blob = alloc::vec![0u8; copy_size];
-            read_data_from_shm_with_offset(&shm_info, offset, &mut blob)?;
-            let (msg_args, rpc_args) = parse_optee_msg_args(&blob, true)?;
-
-            // Compute the physical address of `OpteeMsgArgs`
-            let total_offset = shm_info
-                .page_offset
-                .checked_add(offset)
-                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-            let page_index = total_offset / PAGE_SIZE;
-            let offset_in_page = total_offset % PAGE_SIZE;
-            if page_index >= shm_info.page_addrs.len() {
-                return Err(OpteeSmcReturnCode::EBadAddr);
-            }
-            let msg_args_addr = shm_info.page_addrs[page_index].as_usize() + offset_in_page;
+            let (msg_args, rpc_args, msg_args_addr) =
+                read_optee_msg_args_from_registered_shm(shm_ref, offset)?;
 
             Ok(OpteeSmcResult::CallWithArg {
                 msg_args,
-                rpc_args,
-                msg_args_phys_addr: msg_args_addr as u64,
+                rpc_args: Some(rpc_args),
+                msg_args_phys_addr: msg_args_addr,
             })
         }
         OpteeSmcFunction::ReturnFromRpc => {
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
-            let msg_args_addr: usize = msg_args_addr.truncate();
-            let (msg_args, rpc_args) = read_optee_msg_args_from_phys(msg_args_addr, true)?;
-            let rpc_args = rpc_args.ok_or(OpteeSmcReturnCode::EBadAddr)?;
-            Ok(OpteeSmcResult::ReturnFromRpc {
-                msg_args,
-                rpc_args,
-                msg_args_phys_addr: msg_args_addr as u64,
-            })
+
+            #[cfg(debug_assertions)]
+            litebox_util_log::debug!(
+                "handle_optee_smc_args: OpteeSmcFunction::ReturnFromRpc, msg_args_addr: {msg_args_addr:#x}"
+            );
+
+            if is_virtual_address(msg_args_addr) {
+                let (shm_ref, offset) = smc.optee_regd_shm_ref_and_offset()?;
+                let (msg_args, rpc_args, msg_args_phys_addr) =
+                    read_optee_msg_args_from_registered_shm(shm_ref, offset)?;
+                Ok(OpteeSmcResult::ReturnFromRpc {
+                    msg_args,
+                    rpc_args,
+                    msg_args_phys_addr,
+                })
+            } else {
+                let msg_args_addr: usize = msg_args_addr.truncate();
+                let (msg_args, rpc_args) = read_optee_msg_args_from_phys(msg_args_addr, true)?;
+                let rpc_args = rpc_args.ok_or(OpteeSmcReturnCode::EBadAddr)?;
+                Ok(OpteeSmcResult::ReturnFromRpc {
+                    msg_args,
+                    rpc_args,
+                    msg_args_phys_addr: msg_args_addr as u64,
+                })
+            }
         }
         OpteeSmcFunction::ExchangeCapabilities => {
+            #[cfg(debug_assertions)]
+            litebox_util_log::debug!("handle_optee_smc_args: OpteeSmcFunction::ExchangeCapabilities");
             // TODO: update the below when we support more features
             let default_cap = OpteeSecureWorldCapabilities::DYNAMIC_SHM
                 | OpteeSecureWorldCapabilities::MEMREF_NULL
@@ -324,6 +375,9 @@ pub fn prepare_load_ta_rpc(
     memref_size: u64,
     memref: Option<OpteeMsgParamRmem>,
 ) -> Result<(), OpteeSmcReturnCode> {
+
+    litebox_util_log::debug!(">2>prepare_load_ta_rpc: Preparing LOAD_TA RPC for TA UUID: {ta_uuid:?}");
+
     // Set up the RPC command for LOAD_TA
     // Note: RPC uses the same wire format as OpteeMsgArgs, but cmd field contains RPC command IDs.
     rpc_msg_args.cmd = OpteeRpcCommand::LoadTa;
@@ -408,6 +462,10 @@ pub fn handle_optee_msg_args(msg_args: &OpteeMsgArgs) -> Result<(), OpteeSmcRetu
             let shm_ref_pages_data_phys_addr = page_align_down(tmem.buf_ptr);
             let page_offset = tmem.buf_ptr - shm_ref_pages_data_phys_addr;
             let aligned_size = page_align_up(page_offset + tmem.size);
+            let shm_ref = tmem.shm_ref;
+            litebox_util_log::debug!(
+                "handle_optee_msg_args: RegisterShm: shm_ref_pages_data_phys_addr=0x{shm_ref_pages_data_phys_addr:x}, page_offset=0x{page_offset:x}, aligned_size=0x{aligned_size:x}, shm_ref={shm_ref:?}"
+            );
             shm_ref_map().register_shm(
                 shm_ref_pages_data_phys_addr,
                 page_offset,
