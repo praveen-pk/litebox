@@ -40,11 +40,14 @@ use litebox_platform_lvbs::{
     serial_println,
 };
 use litebox_platform_multiplex::Platform;
-use litebox_shim_optee::msg_handler::{
-    decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
-};
 use litebox_shim_optee::session::{OpenSessionTarget, TaInstance, session_manager};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
+use litebox_shim_optee::{
+    msg_handler::{
+        decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
+    },
+    rpc_context::{RpcStage, rpc_context_map},
+};
 
 /// Seed the initial heap regions so the global allocator has enough memory
 /// for slab-backed allocations (the slab needs >= 2 MB backing pages).
@@ -555,9 +558,23 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                     smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                     return *smc_args;
                 };
+                // Track RPC context starting with first LOAD_TA request
+                let context_id = match rpc_context_map().allocate(RpcStage::LoadTaSize) {
+                    Ok(context_id) => context_id,
+                    Err(error) => {
+                        debug_serial_println!(
+                            "Failed to allocate RPC context for LOAD_TA request: {:?}",
+                            error
+                        );
+                        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                        return *smc_args;
+                    }
+                };
+                smc_args.set_rpc_context_id(context_id);
                 if let Err(e) =
                     write_rpc_args_to_normal_world(&msg_args, msg_args_phys_addr, rpc_args_ref)
                 {
+                    let _ = rpc_context_map().take(context_id);
                     smc_args.set_return_code(e);
                 } else {
                     smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
