@@ -15,8 +15,9 @@ use litebox::{
 use litebox_common_linux::errno::Errno;
 use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcResult,
-    OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
+    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgAttrType, OpteeMsgParamRmem, OpteeMsgParamValue,
+    OpteeRpcArgs, OpteeRpcCommand, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin,
+    TeeResult, TeeUuid, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
 };
 use litebox_platform_lvbs::mshv::vsm::{LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, LvbsVtl1Gate};
 use litebox_platform_lvbs::{
@@ -520,14 +521,14 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
     };
     if let OpteeSmcResult::CallWithArg {
         msg_args,
-        rpc_args: _,
+        mut rpc_args,
         msg_args_phys_addr,
     } = smc_result
     {
         let mut msg_args = *msg_args;
         debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
         let result = match msg_args.cmd {
-            OpenSession => handle_open_session(&mut msg_args, msg_args_phys_addr),
+            OpenSession => handle_open_session(&mut msg_args, &mut rpc_args, msg_args_phys_addr),
             InvokeCommand => handle_invoke_command(&mut msg_args, msg_args_phys_addr),
             CloseSession => handle_close_session(&mut msg_args, msg_args_phys_addr),
             _ => {
@@ -548,7 +549,20 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
         unsafe { switch_to_base_page_table() };
 
         if let Err(e) = result {
-            smc_args.set_return_code(e);
+            if e == OpteeSmcReturnCode::RpcCmd {
+                debug_serial_println!("OP-TEE SMC returning RPC command to normal world");
+                let rpc_args_ref = rpc_args.as_ref().unwrap();
+                if let Err(e) =
+                    write_rpc_args_to_normal_world(&msg_args, msg_args_phys_addr, rpc_args_ref)
+                {
+                    smc_args.set_return_code(e);
+                } else {
+                    smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
+                }
+            } else {
+                debug_serial_println!("OP-TEE SMC returning error code: {:?}", e);
+                smc_args.set_return_code(e);
+            }
         } else {
             smc_args.set_return_code(OpteeSmcReturnCode::Ok);
         }
@@ -556,6 +570,47 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
     } else {
         smc_result.into()
     }
+}
+
+/// Prepare a LOAD_TA RPC request to be sent to normal world (VTL0).
+/// # Parameters
+/// - `rpc_msg_args`: The RPC message arguments to be filled in.
+/// - `ta_uuid`: The UUID of the TA to be loaded.
+/// - `memref_size`: The size of the memory reference for the TA binary.
+/// - `memref`: An optional memory reference for the TA binary. If provided, it will be passed to VTL0 via RPC.
+/// # Returns
+/// - `Ok(())` if the RPC message arguments were successfully prepared.
+pub fn prepare_load_ta_rpc(
+    rpc_msg_args: &mut OpteeRpcArgs,
+    ta_uuid: TeeUuid,
+    memref_size: u64,
+    memref: Option<OpteeMsgParamRmem>,
+) -> Result<(), OpteeSmcReturnCode> {
+    rpc_msg_args.cmd = OpteeRpcCommand::LoadTa;
+    rpc_msg_args.num_params = 2;
+
+    rpc_msg_args
+        .set_param_attr_type(0, OpteeMsgAttrType::ValueInput)
+        .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+    let uuid_bytes = ta_uuid.to_le_bytes();
+    rpc_msg_args.set_param_value(
+        0,
+        OpteeMsgParamValue {
+            a: u64::from_le_bytes(uuid_bytes[..8].try_into().unwrap()),
+            b: u64::from_le_bytes(uuid_bytes[8..].try_into().unwrap()),
+            c: 0,
+        },
+    )?;
+
+    rpc_msg_args
+        .set_param_attr_type(1, OpteeMsgAttrType::RmemOutput)
+        .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+    rpc_msg_args.set_param_rmem_size(1, memref_size)?;
+    if let Some(rmem) = memref {
+        rpc_msg_args.set_param_rmem(1, rmem)?;
+    }
+
+    Ok(())
 }
 
 /// Handle OpenSession command.
@@ -569,11 +624,27 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
 /// instance cleanup for TARGET_DEAD on single-instance TAs).
 fn handle_open_session(
     msg_args: &mut OpteeMsgArgs,
+    rpc_args: &mut Option<Box<OpteeRpcArgs>>,
     msg_args_phys_addr: u64,
 ) -> Result<(), OpteeSmcReturnCode> {
     let ta_req_info = decode_ta_request(msg_args).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
     if ta_req_info.entry_func != UteeEntryFunc::OpenSession {
         return Err(OpteeSmcReturnCode::EBadCmd);
+    }
+    let shim: litebox_shim_optee::OpteeShim = litebox_shim_optee::OpteeShimBuilder::new().build();
+
+    //TODO: Extend the below logic for LDELF as well
+    let ta_uuid = ta_req_info.uuid.ok_or(OpteeSmcReturnCode::EBadCmd)?;
+    if shim.get_ta_bin(&ta_uuid).is_none() {
+        debug_serial_println!(
+            "TA binary not found for uuid={:?}, returning EBadCmd",
+            ta_uuid
+        );
+        let rpc_mut = rpc_args.as_mut().ok_or(OpteeSmcReturnCode::EBadCmd)?;
+        //NOTE: As the TA size is not known, we are passing 0 for memref_size and None for memref.
+        //      VTL0 will handle this case and compute the required memory to load the TA.
+        prepare_load_ta_rpc(rpc_mut, ta_uuid, 0, None)?;
+        return Err(OpteeSmcReturnCode::RpcCmd);
     }
 
     let ta_uuid = ta_req_info.uuid.ok_or(OpteeSmcReturnCode::EBadCmd)?;
@@ -807,15 +878,12 @@ fn open_session_new_instance(
     })?;
 
     // Load ldelf and TA - Box immediately to keep at fixed heap address
-    let loaded_program = Box::new(
-        shim.load_ldelf(LDELF_BINARY, ta_uuid)
-            .map_err(|_| {
-                // Safety: We are about to tear down this TA instance;
-                // no references to user-space memory will be held afterwards.
-                unsafe { teardown_ta_page_table(&shim, task_pt_id) };
-                OpteeSmcReturnCode::ENomem
-            })?,
-    );
+    let loaded_program = Box::new(shim.load_ldelf(LDELF_BINARY, ta_uuid).map_err(|_| {
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
+        OpteeSmcReturnCode::ENomem
+    })?);
 
     let ta_flags = loaded_program.ta_flags;
 
@@ -1321,7 +1389,6 @@ fn write_non_ta_msg_args_to_normal_world(
 /// Unlike [`write_msg_args_to_normal_world`], this function does not access TA userspace
 /// memory and can be called from the base page table context. It simply serializes the
 /// rpc_args and writes it to the normal world physical address.
-#[expect(dead_code)]
 #[inline]
 fn write_rpc_args_to_normal_world(
     msg_args: &OpteeMsgArgs,
@@ -1343,8 +1410,10 @@ fn write_rpc_args_to_normal_world(
 }
 
 // use include_bytes! to include ldelf
-const LDELF_BINARY: &[u8] = include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/ldelf.elf");
-const TA_BINARY: &[u8] = include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
+const LDELF_BINARY: &[u8] =
+    include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/ldelf.elf");
+const TA_BINARY: &[u8] =
+    include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
 const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
 
 /// Register a TA binary embedded in the runner image.

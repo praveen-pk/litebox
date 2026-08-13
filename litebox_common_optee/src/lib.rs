@@ -2117,6 +2117,48 @@ impl OpteeRpcArgs {
         }
     }
 
+    /// Set a parameter's attribute type by index with bounds checking against `num_params`.
+    pub fn set_param_attr_type(
+        &mut self,
+        index: usize,
+        attr_type: OpteeMsgAttrType,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].attr = OpteeMsgAttr(attr_type as u64);
+            Ok(())
+        }
+    }
+
+    /// Set the size field of an rmem parameter by index.
+    pub fn set_param_rmem_size(
+        &mut self,
+        index: usize,
+        size: u64,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].data[8..16].copy_from_slice(&size.to_le_bytes());
+            Ok(())
+        }
+    }
+
+    /// Set an rmem parameter by index with bounds checking against `num_params`.
+    pub fn set_param_rmem(
+        &mut self,
+        index: usize,
+        rmem: OpteeMsgParamRmem,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].data.copy_from_slice(rmem.as_bytes());
+            Ok(())
+        }
+    }
+
     /// Set a tmem parameter by index with bounds checking against `num_params`.
     pub fn set_param_tmem(
         &mut self,
@@ -2130,10 +2172,6 @@ impl OpteeRpcArgs {
             Ok(())
         }
     }
-
-    // Note: RPC does not use rmem params. Rmem requires pre-registered shared memory
-    // references from the normal-world driver, which is a main-messaging-path concept.
-    // RPC uses tmem for buffer references since OP-TEE provides physical addresses directly.
 }
 
 /// Serialize the params portion as raw bytes into `buf`.
