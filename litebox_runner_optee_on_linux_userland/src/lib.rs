@@ -109,6 +109,7 @@ fn run_ta_with_default_commands(
     ldelf_bin: &[u8],
     ta_bin: &[u8],
 ) {
+    shim.store_ta_bin(&TeeUuid::default(), ta_bin);
     for func_id in [UteeEntryFunc::OpenSession, UteeEntryFunc::CloseSession] {
         let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
@@ -116,7 +117,7 @@ fn run_ta_with_default_commands(
             let session_token = session_manager().try_acquire_open_session_token().unwrap();
             let session_id = session_token.session_id().unwrap();
             let loaded_program = shim
-                .load_ldelf(ldelf_bin, TeeUuid::default(), Some(ta_bin))
+                .load_ldelf(ldelf_bin, TeeUuid::default())
                 .map_err(|_| {
                     panic!("Failed to load ldelf");
                 })

@@ -27,6 +27,7 @@ pub fn run_ta_with_test_commands(
         let json_str = std::fs::read_to_string(json_path).unwrap();
         serde_json::from_str(&json_str).unwrap()
     };
+    shim.store_ta_bin(&TeeUuid::default(), ta_bin);
     let mut ta_info: Option<LoadedProgram> = None;
     // The active session id for the TA. Set at OpenSession and reused for the
     // subsequent InvokeCommand entries on the same persistent session.
@@ -67,7 +68,7 @@ pub fn run_ta_with_test_commands(
             );
             session_manager().set_session_client_identity(open_session_id, Some(client_identity));
             let loaded = shim
-                .load_ldelf(ldelf_bin, ta_head.uuid, Some(ta_bin))
+                .load_ldelf(ldelf_bin, ta_head.uuid)
                 .map_err(|_| {
                     panic!("Failed to load TA");
                 })
