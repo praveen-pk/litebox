@@ -1427,6 +1427,9 @@ fn register_embedded_ta(shim: &litebox_shim_optee::OpteeShim, ta_binary: &'stati
 /// Register all TA binaries embedded in the runner image.
 fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim) {
     for ta_binary in TA_BINARIES {
+        if ta_binary.is_empty() {
+            continue;
+        }
         assert!(register_embedded_ta(shim, ta_binary));
     }
 }
