@@ -646,6 +646,7 @@ fn handle_open_session(
         prepare_load_ta_rpc(rpc_mut, ta_uuid, 0, None)?;
         return Err(OpteeSmcReturnCode::RpcCmd);
     }
+    debug_serial_println!("PPK: Found TA binary for uuid={:?}", ta_uuid);
 
     let ta_uuid = ta_req_info.uuid.ok_or(OpteeSmcReturnCode::EBadCmd)?;
     let client_identity = ta_req_info.client_identity;
@@ -1412,7 +1413,7 @@ fn write_rpc_args_to_normal_world(
 // use include_bytes! to include ldelf
 const LDELF_BINARY: &[u8] =
     include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/ldelf.elf");
-const TA_BINARY: &[u8] = &[0u8; 0]; 
+const TA_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
 
 /// Register a TA binary embedded in the runner image.
