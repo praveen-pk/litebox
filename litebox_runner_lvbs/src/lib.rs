@@ -14,6 +14,7 @@ use litebox::{
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
+use litebox_common_optee::OpteeRpcShmType;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcResult,
     OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
@@ -40,6 +41,7 @@ use litebox_platform_lvbs::{
     serial_println,
 };
 use litebox_platform_multiplex::Platform;
+use litebox_shim_optee::msg_handler::prepare_shm_alloc_rpc;
 use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
 };
@@ -519,59 +521,86 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
         return *smc_args;
     };
-    if let OpteeSmcResult::CallWithArg {
-        msg_args,
-        mut rpc_args,
-        msg_args_phys_addr,
-    } = smc_result
-    {
-        let mut msg_args = *msg_args;
-        debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
-        let result = match msg_args.cmd {
-            OpenSession => handle_open_session(&mut msg_args, &mut rpc_args, msg_args_phys_addr),
-            InvokeCommand => handle_invoke_command(&mut msg_args, msg_args_phys_addr),
-            CloseSession => handle_close_session(&mut msg_args, msg_args_phys_addr),
-            _ => {
-                let r = handle_optee_msg_args(&msg_args);
-                if r.is_ok() {
-                    msg_args.ret = TeeResult::Success;
-                } else {
-                    msg_args.ret = TeeResult::BadParameters;
+    match smc_result {
+        OpteeSmcResult::CallWithArg {
+            msg_args,
+            mut rpc_args,
+            msg_args_phys_addr,
+        } => {
+            let mut msg_args = *msg_args;
+            debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
+            let result = match msg_args.cmd {
+                OpenSession => {
+                    handle_open_session(&mut msg_args, &mut rpc_args, msg_args_phys_addr)
                 }
-                msg_args.ret_origin = TeeOrigin::Tee;
-                let _ = write_non_ta_msg_args_to_normal_world(&msg_args, msg_args_phys_addr);
-                r
-            }
-        };
+                InvokeCommand => handle_invoke_command(&mut msg_args, msg_args_phys_addr),
+                CloseSession => handle_close_session(&mut msg_args, msg_args_phys_addr),
+                _ => {
+                    let r = handle_optee_msg_args(&msg_args);
+                    if r.is_ok() {
+                        msg_args.ret = TeeResult::Success;
+                    } else {
+                        msg_args.ret = TeeResult::BadParameters;
+                    }
+                    msg_args.ret_origin = TeeOrigin::Tee;
+                    let _ = write_non_ta_msg_args_to_normal_world(&msg_args, msg_args_phys_addr);
+                    r
+                }
+            };
 
-        // Always switch back to base page table before returning to VTL0
-        // Safety: No user-space memory references are held after this point
-        unsafe { switch_to_base_page_table() };
+            // Always switch back to base page table before returning to VTL0
+            // Safety: No user-space memory references are held after this point
+            unsafe { switch_to_base_page_table() };
 
-        if let Err(e) = result {
-            if e == OpteeSmcReturnCode::RpcCmd {
-                debug_serial_println!("OP-TEE SMC returning RPC command to normal world");
-                let Some(rpc_args_ref) = rpc_args.as_ref() else {
-                    smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
-                    return *smc_args;
-                };
-                if let Err(e) =
-                    write_rpc_args_to_normal_world(&msg_args, msg_args_phys_addr, rpc_args_ref)
-                {
-                    smc_args.set_return_code(e);
+            if let Err(e) = result {
+                if e == OpteeSmcReturnCode::RpcCmd {
+                    debug_serial_println!("OP-TEE SMC returning RPC command to normal world");
+                    let rpc_args_ref = rpc_args.as_ref().unwrap();
+                    if let Err(e) =
+                        write_rpc_args_to_normal_world(&msg_args, msg_args_phys_addr, rpc_args_ref)
+                    {
+                        smc_args.set_return_code(e);
+                    } else {
+                        smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
+                    }
                 } else {
-                    smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
+                    debug_serial_println!("OP-TEE SMC returning error code: {:?}", e);
+                    smc_args.set_return_code(e);
                 }
             } else {
-                debug_serial_println!("OP-TEE SMC returning error code: {:?}", e);
-                smc_args.set_return_code(e);
+                smc_args.set_return_code(OpteeSmcReturnCode::Ok);
             }
-        } else {
-            smc_args.set_return_code(OpteeSmcReturnCode::Ok);
+            *smc_args
         }
-        *smc_args
-    } else {
-        smc_result.into()
+        OpteeSmcResult::ReturnFromRpc {
+            msg_args,
+            rpc_args,
+            msg_args_phys_addr,
+        } => {
+            let mut rpc_args = *rpc_args;
+            let buf_size = rpc_args.get_param_rmem_size(1).unwrap_or(0);
+            if buf_size == 0 {
+                debug_serial_println!("Invalid buffer size in ReturnFromRpc");
+                smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                return *smc_args;
+            }
+
+            // Request VTL0 to allocate a SHM buffer for the TA binary
+            if let Err(e) = prepare_shm_alloc_rpc(
+                &mut rpc_args,
+                OpteeRpcShmType::Appl,
+                buf_size,
+                8, // 8-byte alignment required by OP-TEE SMC calls
+            ) {
+                debug_serial_println!("Failed to prepare SHM_ALLOC RPC: {:?}", e);
+                smc_args.set_return_code(e);
+                return *smc_args;
+            }
+            let _ = write_rpc_args_to_normal_world(&msg_args, msg_args_phys_addr, &rpc_args);
+            smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
+            *smc_args
+        }
+        _ => smc_result.into(),
     }
 }
 

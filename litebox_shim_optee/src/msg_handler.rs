@@ -23,10 +23,10 @@ use litebox::{mm::linux::PAGE_SIZE, platform::RawConstPointer, utils::TruncateEx
 use litebox_common_linux::vmap::PhysPageAddr;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeMsgAttrType, OpteeMsgParamRmem,
-    OpteeMsgParamTmem, OpteeMsgParamValue, OpteeRpcArgs, OpteeSecureWorldCapabilities,
-    OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturnCode, TeeIdentity, TeeLogin,
-    TeeOrigin, TeeParamType, TeeResult, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
-    optee_msg_args_total_size,
+    OpteeMsgParamTmem, OpteeMsgParamValue, OpteeRpcArgs, OpteeRpcCommand, OpteeRpcShmType,
+    OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult,
+    OpteeSmcReturnCode, TeeIdentity, TeeLogin, TeeOrigin, TeeParamType, TeeResult, TeeUuid,
+    UteeEntryFunc, UteeParamOwned, UteeParams, optee_msg_args_total_size,
 };
 use once_cell::race::OnceBox;
 use zerocopy::{FromBytes, Immutable};
@@ -237,6 +237,18 @@ pub fn handle_optee_smc_args(
                 msg_args_phys_addr: msg_args_addr as u64,
             })
         }
+        OpteeSmcFunction::ReturnFromRpc => {
+            let msg_args_addr = smc.optee_msg_args_phys_addr()?;
+            let msg_args_addr: usize = msg_args_addr.trunc();
+            let (msg_args, rpc_args) = read_optee_msg_args_from_phys(msg_args_addr, true)?;
+            //TODO: Check if this can be None according to protocol definition
+            let rpc_args = rpc_args.ok_or(OpteeSmcReturnCode::EBadAddr)?;
+            Ok(OpteeSmcResult::ReturnFromRpc {
+                msg_args,
+                rpc_args,
+                msg_args_phys_addr: msg_args_addr as u64,
+            })
+        }
         OpteeSmcFunction::CallWithRegdArg => {
             // `OpteeMsgArgs` is located at the offset specified in args[3] within the shared memory region pointed by args[1]:args[2].
             let (shm_ref, offset) = smc.optee_regd_shm_ref_and_offset()?;
@@ -321,6 +333,31 @@ pub fn handle_optee_smc_args(
         }),
         _ => Err(OpteeSmcReturnCode::UnknownFunction),
     }
+}
+
+pub fn prepare_shm_alloc_rpc(
+    rpc_msg_args: &mut OpteeRpcArgs,
+    shm_type: OpteeRpcShmType,
+    size: u64,
+    alignment: u64,
+) -> Result<(), OpteeSmcReturnCode> {
+    rpc_msg_args.cmd = OpteeRpcCommand::ShmAlloc;
+    rpc_msg_args.num_params = 1;
+
+    rpc_msg_args
+        .set_param_attr_type(0, OpteeMsgAttrType::ValueInput)
+        .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+
+    rpc_msg_args.set_param_value(
+        0,
+        OpteeMsgParamValue {
+            a: shm_type as u64,
+            b: size,
+            c: alignment,
+        },
+    )?;
+
+    Ok(())
 }
 
 /// This function handles an OP-TEE message contained in `OpteeMsgArgs`.
