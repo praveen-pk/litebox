@@ -584,7 +584,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                 smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                 return *smc_args;
             }
-
+            debug_serial_println!("PPK: buf_size from SHM_ALLOC = {:?}\n", buf_size);
             // Request VTL0 to allocate a SHM buffer for the TA binary
             if let Err(e) = prepare_shm_alloc_rpc(
                 &mut rpc_args,
