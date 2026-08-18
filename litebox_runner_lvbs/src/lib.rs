@@ -716,9 +716,21 @@ fn handle_return_from_load_ta_rpc(
             ta_bin.len()
         );
 
-        // TODO: Store the TA binary for use during OpenSession
-        // Temporarily return BadCmd here
-        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        // Extract UUID from the original msg_args and store the TA binary
+        let Ok(uuid_param) = msg_args.get_param_value(0) else {
+            debug_serial_println!("Failed to get UUID from msg_args");
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            return;
+        };
+        let ta_uuid = litebox_common_optee::TeeUuid::from_u64_array([uuid_param.a, uuid_param.b]);
+        let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
+        if !shim.store_ta_bin(&ta_uuid, &ta_bin) {
+            debug_serial_println!("Failed to store TA binary for UUID: {:?}", ta_uuid);
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            return;
+        }
+        debug_serial_println!("TA binary stored successfully for UUID: {:?}", ta_uuid);
+        smc_args.set_return_code(OpteeSmcReturnCode::Ok);
         return;
     }
 
