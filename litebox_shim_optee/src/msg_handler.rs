@@ -72,7 +72,7 @@ pub fn page_align_down(address: u64) -> u64 {
 }
 
 #[inline]
-fn page_align_up(len: u64) -> Option<u64> {
+pub fn page_align_up(len: u64) -> Option<u64> {
     len.checked_next_multiple_of(PAGE_SIZE as u64)
 }
 
@@ -797,7 +797,7 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
     /// Read into `buffer` from the normal-world shared memory pages referenced by `self`,
     /// starting at byte `offset` within the view.
     /// Returns `EBadAddr` if the requested range is not entirely within the view.
-    fn read_at(&self, offset: usize, buffer: &mut [u8]) -> Result<(), OpteeSmcReturnCode> {
+    pub fn read_at(&self, offset: usize, buffer: &mut [u8]) -> Result<(), OpteeSmcReturnCode> {
         if offset
             .checked_add(buffer.len())
             .is_none_or(|end| end > self.len)
@@ -812,7 +812,7 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
     /// Write `buffer` to the normal-world shared memory pages referenced by `self`,
     /// starting at the beginning of the view.
     /// Returns `EBadAddr` if `buffer` does not fit within the view.
-    fn write(&self, buffer: &[u8]) -> Result<(), OpteeSmcReturnCode> {
+    pub fn write(&self, buffer: &[u8]) -> Result<(), OpteeSmcReturnCode> {
         if buffer.len() > self.len {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
@@ -1013,40 +1013,4 @@ fn get_shm_info_from_optee_msg_param_rmem(
         start % PAGE_SIZE,
         rmem.size.trunc(),
     )
-}
-
-/// Read data from the normal world shared memory pages whose physical addresses are given in
-/// `shm_info` into `buffer`. The size of `buffer` indicates the number of bytes to read.
-pub fn read_data_from_shm<const ALIGN: usize>(
-    shm_info: &ShmInfo<ALIGN>,
-    buffer: &mut [u8],
-) -> Result<(), OpteeSmcReturnCode> {
-    read_data_from_shm_with_offset(shm_info, 0, buffer)
-}
-
-fn read_data_from_shm_with_offset<const ALIGN: usize>(
-    shm_info: &ShmInfo<ALIGN>,
-    offset: usize,
-    buffer: &mut [u8],
-) -> Result<(), OpteeSmcReturnCode> {
-    let mut ptr: NormalWorldConstPtr<u8, ALIGN> = shm_info.clone().try_into()?;
-    // SAFETY: The data is copied into a buffer owned by LiteBox to avoid TOCTOU issues.
-    unsafe {
-        ptr.read_slice_at_offset(offset, buffer)?;
-    }
-    Ok(())
-}
-
-/// Write data in `buffer` to the normal world shared memory pages whose physical addresses are given
-/// in `shm_info`. The size of `buffer` indicates the number of bytes to write.
-fn write_data_to_shm<const ALIGN: usize>(
-    shm_info: &ShmInfo<ALIGN>,
-    buffer: &[u8],
-) -> Result<(), OpteeSmcReturnCode> {
-    let mut ptr: NormalWorldMutPtr<u8, ALIGN> = shm_info.clone().try_into()?;
-    // SAFETY: The data is written from a buffer owned by LiteBox.
-    unsafe {
-        ptr.write_slice_at_offset(0, buffer)?;
-    }
-    Ok(())
 }
