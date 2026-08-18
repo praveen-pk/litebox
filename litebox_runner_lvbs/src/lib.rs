@@ -14,7 +14,7 @@ use litebox::{
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
-use litebox_common_optee::OpteeRpcShmType;
+use litebox_common_optee::{OpteeMsgAttrType, OpteeMsgParamValue, OpteeRpcShmType, OpteeSmcArgs};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcResult,
     OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
@@ -43,14 +43,13 @@ use litebox_platform_lvbs::{
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::msg_handler::prepare_shm_alloc_rpc;
 use litebox_shim_optee::msg_handler::{
-    decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, page_align_down,
-    page_align_up, prepare_load_ta_rpc, prepare_shm_alloc_rpc, read_data_from_shm, shm_ref_map,
-    update_optee_msg_args,
+    decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, page_align_down, shm_ref_map,
+    update_optee_msg_args, page_align_up
 };
 use litebox_shim_optee::session::{
-    CreationReservation, SessionIdGuard, SessionManager, TaInstance, allocate_session_id,
+    TaInstance
 };
-use litebox_shim_optee::session::{OpenSessionTarget, TaInstance, session_manager};
+use litebox_shim_optee::session::{OpenSessionTarget, session_manager};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 
 /// Seed the initial heap regions so the global allocator has enough memory
@@ -505,7 +504,7 @@ unsafe fn teardown_ta_page_table(shim: &litebox_shim_optee::OpteeShim, task_pt_i
 /// The OP-TEE driver expects all return codes (success or error) to be delivered via
 /// `smc_args.args[0]`.
 fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
-    use OpteeMessageCommand::{CloseSession, InvokeCommand, OpenSession};
+    use litebox_common_optee::OpteeMessageCommand::{CloseSession, InvokeCommand, OpenSession};
 
     // Helper to create error response when we don't read smc_args from the normal world yet
     let make_error_response = |code: OpteeSmcReturnCode| -> OpteeSmcArgs {
@@ -682,10 +681,10 @@ fn handle_return_from_load_ta_rpc(
             smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
             return;
         };
-        let ta_size: usize = rmem.size.truncate();
+        let ta_size: usize = rmem.size.trunc();
         let mut ta_bin = alloc::vec![0u8; ta_size];
-        if let Err(e) = read_data_from_shm(&shm_info, &mut ta_bin) {
-            debug_serial_println!("Failed to read TA buffer from shared memory: {:?}", e);
+        if let Err(e) = shm_info.read_at(0, &mut ta_bin) {
+            debug_serial_println!("Failed to read TA binary from shared memory: {:?}", e);
             smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
             return;
         }
@@ -745,15 +744,54 @@ fn handle_return_from_shm_alloc_rpc(
         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
         return;
     }
+    let ta_req_info = match decode_ta_request(msg_args) {
+        Ok(info) => info,
+        Err(_) => {
+            debug_serial_println!("Failed to decode TA request from msg_args");
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            return;
+        }
+    };
+    let ta_uuid: TeeUuid = match ta_req_info.uuid {
+        Some(uuid) => uuid,
+        None => {
+            debug_serial_println!("Failed to get TA UUID from request");
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            return;
+        }
+    };
+
 
     // Register the TMEM buffer in the SHM ref map
     let tmem_phys_addr = page_align_down(tmem.buf_ptr);
-    let page_offset = (tmem.buf_ptr - tmem_phys_addr) as usize;
-    let aligned_size = page_align_up((page_offset as u64) + tmem.size);
+    let page_offset = tmem
+        .buf_ptr
+        .checked_sub(tmem_phys_addr);
+
+    if page_offset.is_none() {
+        debug_serial_println!("Buffer ad`dress underflow when calculating page offset");
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadAddr);
+        return;
+    }
+
+    let size = page_offset.unwrap()
+                .checked_add(tmem.size);
+    if size.is_none() {
+        debug_serial_println!("Buffer size overflow when calculating aligned size");
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadAddr);
+        return;
+    }
+    let aligned_size = page_align_up(size.unwrap());
+    if aligned_size.is_none() {
+        debug_serial_println!("Buffer size overflow when calculating aligned size");
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadAddr);
+        return;
+    }
     if let Err(e) = shm_ref_map().register_shm(
         tmem_phys_addr,
-        page_offset as u64,
-        aligned_size,
+        page_offset.unwrap() as u64,
+        tmem.size,
+        aligned_size.unwrap() as u64,
         tmem.shm_ref,
     ) {
         debug_serial_println!("Failed to register TMEM from SHM_ALLOC: {:?}", e);
@@ -763,17 +801,17 @@ fn handle_return_from_shm_alloc_rpc(
 
     // Send the final LOAD_TA request with the allocated buffer
     debug_serial_println!("Sending final LOAD_TA request with allocated buffer");
-    let Ok(uuid) = msg_args.get_param_value(0) else {
+    /*let Ok(uuid) = msg_args.get_param_value(0) else {
         debug_serial_println!("Failed to get UUID from msg_args");
         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
         return;
-    };
+    };*/
     let rmem = OpteeMsgParamRmem {
-        offs: page_offset as u64,
+        offs: page_offset.unwrap() as u64,
         size: tmem.size,
         shm_ref: tmem.shm_ref,
     };
-    if let Err(e) = prepare_load_ta_rpc(rpc_args, uuid, tmem.size, Some(rmem)) {
+    if let Err(e) = prepare_load_ta_rpc(rpc_args, ta_uuid, tmem.size, Some(rmem)) {
         debug_serial_println!("Failed to prepare final LOAD_TA RPC: {:?}", e);
         smc_args.set_return_code(e);
         return;
@@ -825,6 +863,7 @@ fn handle_open_session(
         return Err(OpteeSmcReturnCode::RpcCmd);
     }
 
+    let ta_uuid: TeeUuid = ta_req_info.uuid.ok_or(OpteeSmcReturnCode::EBadCmd)?;
     let client_identity = ta_req_info.client_identity;
     let params = &ta_req_info.params;
 

@@ -2175,6 +2175,31 @@ impl OpteeRpcArgs {
         }
     }
 
+    /// Set the size field of an rmem parameter by index.
+    pub fn set_param_rmem_size(
+        &mut self,
+        index: usize,
+        size: u64,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].data[8..16].copy_from_slice(&size.to_le_bytes());
+            Ok(())
+        }
+    }
+
+    /// Access an rmem parameter by index with bounds checking against `num_params`.
+    pub fn get_param_rmem(&self, index: usize) -> Result<OpteeMsgParamRmem, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index]
+                .get_param_rmem()
+                .ok_or(OpteeSmcReturnCode::EBadCmd)
+        }
+    }
+
     /// Set an rmem parameter by index with bounds checking against `num_params`.
     pub fn set_param_rmem(
         &mut self,
