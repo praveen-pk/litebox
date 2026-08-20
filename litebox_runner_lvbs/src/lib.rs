@@ -579,6 +579,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
             rpc_args,
             msg_args_phys_addr,
         } => {
+            let mut msg_args = *msg_args;
             let mut rpc_args = *rpc_args;
 
             // rpc_args.cmd is preserved when VTL0 responds to an RPC request.
@@ -587,7 +588,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                 OpteeRpcCommand::LoadTa => {
                     handle_return_from_load_ta_rpc(
                         &mut smc_args,
-                        &msg_args,
+                        &mut msg_args,
                         &mut rpc_args,
                         msg_args_phys_addr,
                     );
@@ -662,7 +663,7 @@ pub fn prepare_load_ta_rpc(
 
 fn handle_return_from_load_ta_rpc(
     smc_args: &mut OpteeSmcArgs,
-    msg_args: &OpteeMsgArgs,
+    msg_args: &mut OpteeMsgArgs,
     rpc_args: &mut OpteeRpcArgs,
     msg_args_phys_addr: u64,
 ) {
@@ -728,7 +729,12 @@ fn handle_return_from_load_ta_rpc(
             return;
         }
         debug_serial_println!("TA binary stored successfully for UUID: {:?}", ta_uuid);
-        smc_args.set_return_code(OpteeSmcReturnCode::Ok);
+        // ReturnFromRpc resumes the original request; the cached TA no longer needs an RPC slot.
+        let mut no_rpc_args = None;
+        match handle_open_session(msg_args, &mut no_rpc_args, msg_args_phys_addr) {
+            Ok(()) => smc_args.set_return_code(OpteeSmcReturnCode::Ok),
+            Err(e) => smc_args.set_return_code(e),
+        }
         return;
     }
 
