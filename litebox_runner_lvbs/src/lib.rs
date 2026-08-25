@@ -14,11 +14,10 @@ use litebox::{
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
-use litebox_common_optee::{OpteeMsgAttrType, OpteeMsgParamValue, OpteeRpcShmType, OpteeSmcArgs};
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcResult,
-    OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
-    prepare_load_ta_rpc,
+    OpteeMsgArgs, OpteeMsgParamRmem, OpteeRpcArgs, OpteeRpcCommand, OpteeRpcShmType, OpteeSmcArgs,
+    OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, TeeUuid, UteeEntryFunc, UteeParams,
+    optee_msg_args_total_size, prepare_load_ta_rpc,
 };
 use litebox_platform_lvbs::mshv::vsm::{LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, LvbsVtl1Gate};
 use litebox_platform_lvbs::{
@@ -613,47 +612,6 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
         }
         _ => smc_result.into(),
     }
-}
-
-/// Prepare a LOAD_TA RPC request to be sent to normal world (VTL0).
-/// # Parameters
-/// - `rpc_msg_args`: The RPC message arguments to be filled in.
-/// - `ta_uuid`: The UUID of the TA to be loaded.
-/// - `memref_size`: The size of the memory reference for the TA binary.
-/// - `memref`: An optional memory reference for the TA binary. If provided, it will be passed to VTL0 via RPC.
-/// # Returns
-/// - `Ok(())` if the RPC message arguments were successfully prepared.
-pub fn prepare_load_ta_rpc(
-    rpc_msg_args: &mut OpteeRpcArgs,
-    ta_uuid: TeeUuid,
-    memref_size: u64,
-    memref: Option<OpteeMsgParamRmem>,
-) -> Result<(), OpteeSmcReturnCode> {
-    rpc_msg_args.cmd = OpteeRpcCommand::LoadTa;
-    rpc_msg_args.num_params = 2;
-
-    rpc_msg_args
-        .set_param_attr_type(0, OpteeMsgAttrType::ValueInput)
-        .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
-    let uuid_bytes = ta_uuid.to_le_bytes();
-    rpc_msg_args.set_param_value(
-        0,
-        OpteeMsgParamValue {
-            a: u64::from_le_bytes(uuid_bytes[..8].try_into().unwrap()),
-            b: u64::from_le_bytes(uuid_bytes[8..].try_into().unwrap()),
-            c: 0,
-        },
-    )?;
-
-    rpc_msg_args
-        .set_param_attr_type(1, OpteeMsgAttrType::RmemOutput)
-        .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
-    rpc_msg_args.set_param_rmem_size(1, memref_size)?;
-    if let Some(rmem) = memref {
-        rpc_msg_args.set_param_rmem(1, rmem)?;
-    }
-
-    Ok(())
 }
 
 /// Handle the return from a LOAD_TA RPC.
