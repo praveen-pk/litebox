@@ -2205,6 +2205,32 @@ impl OpteeRpcArgs {
     }
 }
 
+/// Prepare a shared-memory allocation RPC request to be sent to normal world.
+pub fn prepare_shm_alloc_rpc(
+    rpc_msg_args: &mut OpteeRpcArgs,
+    shm_type: OpteeRpcShmType,
+    size: u64,
+    alignment: u64,
+) -> Result<(), OpteeSmcReturnCode> {
+    rpc_msg_args.cmd = OpteeRpcCommand::ShmAlloc;
+    rpc_msg_args.num_params = 1;
+
+    rpc_msg_args
+        .set_param_attr_type(0, OpteeMsgAttrType::ValueInput)
+        .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+
+    rpc_msg_args.set_param_value(
+        0,
+        OpteeMsgParamValue {
+            a: shm_type as u64,
+            b: size,
+            c: alignment,
+        },
+    )?;
+
+    Ok(())
+}
+
 /// Prepare a LOAD_TA RPC request to be sent to normal world.
 ///
 /// When `memref` is `None`, the request asks normal world to return the TA size.

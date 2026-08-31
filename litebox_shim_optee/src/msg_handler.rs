@@ -237,6 +237,18 @@ pub fn handle_optee_smc_args(
                 msg_args_phys_addr: msg_args_addr as u64,
             })
         }
+        OpteeSmcFunction::ReturnFromRpc => {
+            let msg_args_addr = smc.optee_msg_args_phys_addr()?;
+            let msg_args_addr: usize = msg_args_addr.trunc();
+            let (msg_args, rpc_args) = read_optee_msg_args_from_phys(msg_args_addr, true)?;
+            //TODO: Check if this can be None according to protocol definition
+            let rpc_args = rpc_args.ok_or(OpteeSmcReturnCode::EBadAddr)?;
+            Ok(OpteeSmcResult::ReturnFromRpc {
+                msg_args,
+                rpc_args,
+                msg_args_phys_addr: msg_args_addr as u64,
+            })
+        }
         OpteeSmcFunction::CallWithRegdArg => {
             // `OpteeMsgArgs` is located at the offset specified in args[3] within the shared memory region pointed by args[1]:args[2].
             let (shm_ref, offset) = smc.optee_regd_shm_ref_and_offset()?;
