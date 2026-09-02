@@ -2305,6 +2305,18 @@ impl OpteeSmcArgs {
         }
     }
 
+    /// Set the context ID used to identify an RPC call in the preserved `args[4]` register.
+    pub fn set_rpc_context_id(&mut self, context_id: u32) {
+        self.args[4] = context_id as usize;
+    }
+
+    /// Get the context ID used to identify an RPC call from the preserved `args[4]` register.
+    pub fn get_rpc_context_id(&self) -> Result<u32, OpteeSmcReturnCode> {
+        self.args[4]
+            .try_into()
+            .map_err(|_| OpteeSmcReturnCode::EBadCmd)
+    }
+
     /// Set the return code of an OP-TEE SMC call
     pub fn set_return_code(&mut self, code: OpteeSmcReturnCode) {
         self.args[0] = code as usize;
@@ -2574,6 +2586,23 @@ pub const HUK_SUBKEY_MAX_LEN: usize = 32;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_rpc_context_id_roundtrip() {
+        for context_id in [0, 1, u32::MAX] {
+            let mut args = OpteeSmcArgs::default();
+            args.set_rpc_context_id(context_id);
+            assert_eq!(args.get_rpc_context_id(), Ok(context_id));
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_rpc_context_id_rejects_upper_bits() {
+        let mut args = OpteeSmcArgs::default();
+        args.args[4] = (u32::MAX as usize) + 1;
+        assert_eq!(args.get_rpc_context_id(), Err(OpteeSmcReturnCode::EBadCmd));
+    }
 
     #[test]
     fn test_optee_msg_args_header_size_and_layout() {

@@ -31,6 +31,7 @@ use litebox_common_optee::{
 use litebox_platform_multiplex::Platform;
 
 pub mod loader;
+pub mod rpc_context;
 pub mod session;
 pub(crate) mod syscalls;
 
