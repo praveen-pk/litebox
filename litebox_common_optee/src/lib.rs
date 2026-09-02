@@ -2190,6 +2190,16 @@ impl OpteeRpcArgs {
         }
     }
 
+    /// Get the size of a tmem parameter by index with bounds checking against `num_params`.
+    pub fn get_param_tmem_size(&self, index: usize) -> Result<u64, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            let mut size_bytes = [0; 8];
+            size_bytes.copy_from_slice(&self.params[index].data[8..16]);
+            Ok(u64::from_le_bytes(size_bytes))
+        }
+    }
     /// Set a tmem parameter by index with bounds checking against `num_params`.
     pub fn set_param_tmem(
         &mut self,

@@ -67,7 +67,7 @@ const MAX_SHM_MEMREF_SIZE: usize = 8 * 1024 * 1024;
 const MAX_SHM_REF_MAP_ENTRIES: usize = 1024;
 
 #[inline]
-fn page_align_down(address: u64) -> u64 {
+pub fn page_align_down(address: u64) -> u64 {
     address & !(PAGE_SIZE as u64 - 1)
 }
 
