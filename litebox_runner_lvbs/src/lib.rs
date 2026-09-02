@@ -752,6 +752,22 @@ fn handle_return_from_shm_alloc_rpc(
         smc_args.set_return_code(e);
         return;
     }
+    let context_id = match smc_args.get_rpc_context_id() {
+            Ok(context_id) => context_id,
+            Err(error) => {
+                smc_args.set_return_code(error);
+                return;
+            }
+        };
+        if let Err(error) =
+            rpc_context_map().transition(context_id, RpcStage::ShmAlloc, RpcStage::LoadTaBinary)
+        {
+            debug_serial_println!("Failed to advance RPC context: {:?}", error);
+            let _ = rpc_context_map().take(context_id);
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            return;
+        }
+
     let _ = write_rpc_args_to_normal_world(msg_args, msg_args_phys_addr, rpc_args);
     smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
 }
