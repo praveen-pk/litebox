@@ -38,7 +38,7 @@ use litebox_platform_lvbs::{
     serial_println,
 };
 use litebox_platform_multiplex::Platform;
-use litebox_shim_optee::{msg_handler::register_to_shm, session::{OpenSessionTarget, TaInstance, session_manager}};
+use litebox_shim_optee::{msg_handler::{get_shm_info_from_optee_msg_param_rmem, register_to_shm}, session::{OpenSessionTarget, TaInstance, session_manager}};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 use litebox_shim_optee::{
     msg_handler::{
@@ -624,6 +624,15 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                         msg_args_phys_addr,
                     );
                 }
+                RpcStage::LoadTaBinary => {
+                    handle_return_from_load_ta_rpc(
+                        &mut smc_args,
+                        &msg_args,
+                        &mut rpc_args,
+                        msg_args_phys_addr,
+                        false,
+                    );
+                }
                 _ => {
                     smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                 }
@@ -693,7 +702,57 @@ fn handle_return_from_load_ta_rpc(
         return;
     }
 
-    smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+
+
+    let rmem = match rpc_args.get_param_rmem(1) {
+        Ok(rmem) => rmem,
+        Err(error) => {
+            debug_serial_println!("Failed to get registered memory for TA binary: {:?}", error);
+            smc_args.set_return_code(error);
+            return;
+        }
+    };
+    let shm_info = match get_shm_info_from_optee_msg_param_rmem(rmem) {
+        Ok(shm_info) => shm_info,
+        Err(error) => {
+            debug_serial_println!(
+                "Failed to find SHM info for shm_ref: {:#x}: {:?}",
+                rmem.shm_ref,
+                error
+            );
+            smc_args.set_return_code(error);
+            return;
+        }
+    };
+
+    let ta_size: usize = rmem.size.trunc();
+    let mut ta_bin = alloc::vec![0u8; ta_size];
+    if let Err(e) = shm_info.read_at(0, &mut ta_bin) {
+        debug_serial_println!("Failed to read TA binary from shared memory: {:?}", e);
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    }
+    debug_serial_println!(
+        "Successfully read TA binary from shared memory, size: {}",
+        ta_bin.len()
+    );
+    // Extract UUID from the original msg_args and store the TA binary
+    let Ok(uuid_param) = msg_args.get_param_value(0) else {
+        debug_serial_println!("Failed to get UUID from msg_args");
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    };
+
+    let ta_uuid = litebox_common_optee::TeeUuid::from_u64_array([uuid_param.a, uuid_param.b]);
+    let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
+    if !shim.store_ta_bin(&ta_uuid, &ta_bin) {
+        debug_serial_println!("Failed to store TA binary for UUID: {:?}", ta_uuid);
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    }
+    debug_serial_println!("TA binary stored successfully for UUID: {:?}", ta_uuid);
+    smc_args.set_return_code(OpteeSmcReturnCode::Ok);
+
 }
 
 /// Handle the return from a SHM_ALLOC RPC.

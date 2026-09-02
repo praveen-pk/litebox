@@ -2138,6 +2138,16 @@ impl OpteeRpcArgs {
         }
     }
 
+    pub fn get_param_rmem(&self, index: usize) -> Result<OpteeMsgParamRmem, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index]
+                .get_param_rmem()
+                .ok_or(OpteeSmcReturnCode::EBadCmd)
+        }
+    }
+
     /// Set a value parameter by index with bounds checking against `num_params`.
     pub fn set_param_value(
         &mut self,
