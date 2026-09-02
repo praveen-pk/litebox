@@ -15,9 +15,7 @@ use litebox::{
 use litebox_common_linux::errno::Errno;
 use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeRpcShmType, OpteeSmcArgs, OpteeSmcResult,
-    OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
-    prepare_load_ta_rpc, prepare_shm_alloc_rpc,
+    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgParamRmem, OpteeRpcArgs, OpteeRpcShmType, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, TeeUuid, UteeEntryFunc, UteeParams, optee_msg_args_total_size, prepare_load_ta_rpc, prepare_shm_alloc_rpc,
 };
 use litebox_platform_lvbs::mshv::vsm::{LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, LvbsVtl1Gate};
 use litebox_platform_lvbs::{
@@ -40,7 +38,7 @@ use litebox_platform_lvbs::{
     serial_println,
 };
 use litebox_platform_multiplex::Platform;
-use litebox_shim_optee::session::{OpenSessionTarget, TaInstance, session_manager};
+use litebox_shim_optee::{msg_handler::register_to_shm, session::{OpenSessionTarget, TaInstance, session_manager}};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 use litebox_shim_optee::{
     msg_handler::{
@@ -618,6 +616,14 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                         true,
                     );
                 }
+                RpcStage::ShmAlloc => {
+                    handle_return_from_shm_alloc_rpc(
+                        &mut smc_args,
+                        &msg_args,
+                        &mut rpc_args,
+                        msg_args_phys_addr,
+                    );
+                }
                 _ => {
                     smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                 }
@@ -690,6 +696,65 @@ fn handle_return_from_load_ta_rpc(
     smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
 }
 
+/// Handle the return from a SHM_ALLOC RPC.
+///
+/// VTL0 allocated a TMEM buffer. Register it in the SHM ref map, then send
+/// the final LOAD_TA RPC with the buffer so VTL0 can write the TA binary into it.
+fn handle_return_from_shm_alloc_rpc(
+    smc_args: &mut OpteeSmcArgs,
+    msg_args: &OpteeMsgArgs,
+    rpc_args: &mut OpteeRpcArgs,
+    msg_args_phys_addr: u64,
+) {
+    let Ok(tmem) = rpc_args.get_param_tmem(0) else {
+        debug_serial_println!("Failed to get TMEM param from SHM_ALLOC RPC");
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    };
+    if tmem.buf_ptr == 0 || tmem.size == 0 || tmem.shm_ref == 0 {
+        debug_serial_println!("Invalid buffer info received from SHM_ALLOC");
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    }
+    let ta_req_info = match decode_ta_request(msg_args) {
+        Ok(info) => info,
+        Err(_) => {
+            debug_serial_println!("Failed to decode TA request from msg_args");
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            return;
+        }
+    };
+    let uuid: TeeUuid = match ta_req_info.uuid {
+        Some(uuid) => uuid,
+        None => {
+            debug_serial_println!("Failed to get TA UUID from request");
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            return;
+        }
+    };
+    let page_offset = match register_to_shm(&tmem) {
+        Ok(page_offset) => page_offset,
+        Err(e) => {
+            debug_serial_println!("Failed to register TMEM from SHM_ALLOC: {:?}", e);
+            smc_args.set_return_code(e);
+            return;
+        }
+    };
+    // Send the final LOAD_TA request with the allocated buffer
+    debug_serial_println!("Sending final LOAD_TA request with allocated buffer");
+    let rmem = OpteeMsgParamRmem {
+        offs: page_offset as u64,
+        size: tmem.size,
+        shm_ref: tmem.shm_ref,
+    };
+    if let Err(e) = prepare_load_ta_rpc(rpc_args, uuid, tmem.size, Some(rmem)) {
+        debug_serial_println!("Failed to prepare final LOAD_TA RPC: {:?}", e);
+        smc_args.set_return_code(e);
+        return;
+    }
+    let _ = write_rpc_args_to_normal_world(msg_args, msg_args_phys_addr, rpc_args);
+    smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
+}
 /// Handle OpenSession command.
 ///
 /// For multi-instance TAs, creates a new task page table and loads ldelf/TA into it.

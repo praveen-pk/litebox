@@ -237,6 +237,28 @@ pub fn read_optee_msg_args_from_regd_shm(
     Ok((msg_args, rpc_args, msg_args_phys_addr))
 }
 
+pub fn register_to_shm(
+    tmem_param: &OpteeMsgParamTmem,
+    ) -> Result<u64, OpteeSmcReturnCode> {
+        let tmem_phys_addr = page_align_down(tmem_param.buf_ptr);
+        let page_offset = tmem_param
+            .buf_ptr
+            .checked_sub(tmem_phys_addr)
+            .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+        let total_size = page_offset
+            .checked_add(tmem_param.size)
+            .ok_or(OpteeSmcReturnCode::ENomem)?;
+        let aligned_size = page_align_up(total_size).ok_or(OpteeSmcReturnCode::ENomem)?;
+
+        shm_ref_map().register_shm(
+            tmem_phys_addr,
+            page_offset,
+            tmem_param.size,
+            aligned_size,
+            tmem_param.shm_ref,
+        )?;
+        Ok(page_offset)
+}
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
 /// It returns an `OpteeSmcResult` representing the result of the SMC call or `OpteeMsgArgs` it contains
 /// if the SMC call involves with an OP-TEE message which should be handled by
