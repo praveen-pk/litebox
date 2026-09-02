@@ -41,6 +41,7 @@ pub mod msg_handler;
 pub mod idk;
 
 // Re-export session management types for convenience
+pub use msg_handler::read_optee_msg_args_from_regd_shm;
 pub use session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
