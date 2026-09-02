@@ -1490,7 +1490,8 @@ fn write_rpc_args_to_normal_world(
 }
 
 // use include_bytes! to include ldelf
-const LDELF_BINARY: &[u8] = &[0u8; 0];
+const LDELF_BINARY: &[u8] =
+    include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/ldelf.elf");
 const TA_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
 
