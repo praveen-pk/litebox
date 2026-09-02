@@ -584,6 +584,8 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                 } else {
                     smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                 }
+            } else {
+                smc_args.set_return_code(OpteeSmcReturnCode::Ok);
             }
             *smc_args
         }
