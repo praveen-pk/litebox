@@ -565,17 +565,29 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                         return *smc_args;
                     };
                     // Track RPC context starting with first LOAD_TA request
-                    let context_id = match rpc_context_map().allocate(RpcStage::LoadTaSize) {
-                        Ok(context_id) => context_id,
+                    let regd_shm_offset = match smc_args.optee_regd_shm_ref_and_offset() {
+                        Ok((_, offset)) => offset,
                         Err(error) => {
-                            debug_serial_println!(
-                                "Failed to allocate RPC context for LOAD_TA request: {:?}",
-                                error
-                            );
-                            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                            smc_args.set_return_code(error);
                             return *smc_args;
                         }
                     };
+                    let context_id =
+                        match rpc_context_map().allocate(RpcStage::LoadTaSize, regd_shm_offset) {
+                            Ok(context_id) => context_id,
+                            Err(error) => {
+                                debug_serial_println!(
+                                    "Failed to allocate RPC context for LOAD_TA request: {:?}",
+                                    error
+                                );
+                                smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                                return *smc_args;
+                            }
+                        };
+                    debug_serial_println!(
+                        "Allocated RPC context ID {} for LOAD_TA request",
+                        context_id
+                    );
                     smc_args.set_rpc_context_id(context_id);
                     if let Err(e) =
                         write_rpc_args_to_normal_world(&msg_args, msg_args_phys_addr, rpc_args_ref)
@@ -607,6 +619,11 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                     return *smc_args;
                 }
             };
+            debug_serial_println!(
+                "OP-TEE SMC returning from RPC, context_id: {}, msg_args.cmd: {:?}",
+                context_id,
+                msg_args.cmd
+            );
             let Some(curr_stage) = rpc_context_map().get_curr_stage(context_id) else {
                 smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                 return *smc_args;

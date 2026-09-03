@@ -30,10 +30,16 @@ pub enum RpcContextError {
     UnexpectedStage,
 }
 
-/// Maps RPC context IDs to trusted continuation stages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RpcContext {
+    stage: RpcStage,
+    regd_shm_offset: usize,
+}
+
+/// Maps RPC context IDs to trusted continuation state.
 pub struct RpcContextMap {
     next_id: AtomicU32,
-    inner: SpinMutex<HashMap<u32, RpcStage>>,
+    inner: SpinMutex<HashMap<u32, RpcContext>>,
     max_contexts: usize,
 }
 
@@ -51,8 +57,12 @@ impl RpcContextMap {
         }
     }
 
-    /// Allocate a unique context ID and associate it with `stage`.
-    pub fn allocate(&self, stage: RpcStage) -> Result<u32, RpcContextError> {
+    /// Allocate a unique context ID and associate it with trusted continuation state.
+    pub fn allocate(
+        &self,
+        stage: RpcStage,
+        regd_shm_offset: usize,
+    ) -> Result<u32, RpcContextError> {
         let mut contexts = self.inner.lock();
         if contexts.len() >= self.max_contexts {
             return Err(RpcContextError::Full);
@@ -62,7 +72,10 @@ impl RpcContextMap {
         for _ in 0..=contexts.len() {
             let context_id = self.next_id.fetch_add(1, Ordering::Relaxed);
             if let hashbrown::hash_map::Entry::Vacant(entry) = contexts.entry(context_id) {
-                entry.insert(stage);
+                entry.insert(RpcContext {
+                    stage,
+                    regd_shm_offset,
+                });
                 return Ok(context_id);
             }
         }
@@ -79,13 +92,30 @@ impl RpcContextMap {
         if contexts.len() >= self.max_contexts {
             return Err(RpcContextError::Full);
         }
-        contexts.insert(context_id, stage);
+        contexts.insert(
+            context_id,
+            RpcContext {
+                stage,
+                regd_shm_offset: 0,
+            },
+        );
         Ok(())
     }
 
     /// Get the current stage for `context_id`.
     pub fn get_curr_stage(&self, context_id: u32) -> Option<RpcStage> {
-        self.inner.lock().get(&context_id).copied()
+        self.inner
+            .lock()
+            .get(&context_id)
+            .map(|context| context.stage)
+    }
+
+    /// Get the registered-SHM offset captured before `args[3]` became the context ID.
+    pub fn get_regd_shm_offset(&self, context_id: u32) -> Option<usize> {
+        self.inner
+            .lock()
+            .get(&context_id)
+            .map(|context| context.regd_shm_offset)
     }
 
     /// Atomically advance a context from `expected` to `next`.
@@ -96,19 +126,22 @@ impl RpcContextMap {
         next: RpcStage,
     ) -> Result<(), RpcContextError> {
         let mut contexts = self.inner.lock();
-        let stage = contexts
+        let context = contexts
             .get_mut(&context_id)
             .ok_or(RpcContextError::NotFound)?;
-        if *stage != expected {
+        if context.stage != expected {
             return Err(RpcContextError::UnexpectedStage);
         }
-        *stage = next;
+        context.stage = next;
         Ok(())
     }
 
     /// Remove and return a context's stage.
     pub fn take(&self, context_id: u32) -> Option<RpcStage> {
-        self.inner.lock().remove(&context_id)
+        self.inner
+            .lock()
+            .remove(&context_id)
+            .map(|context| context.stage)
     }
 
     /// Return the number of active RPC contexts.
@@ -141,17 +174,19 @@ mod tests {
     #[test]
     fn allocates_unique_context_ids() {
         let contexts = RpcContextMap::new();
-        let first = contexts.allocate(RpcStage::LoadTaSize).unwrap();
-        let second = contexts.allocate(RpcStage::LoadTaSize).unwrap();
+        let first = contexts.allocate(RpcStage::LoadTaSize, 0x100).unwrap();
+        let second = contexts.allocate(RpcStage::LoadTaSize, 0x200).unwrap();
 
         assert_ne!(first, second);
         assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts.get_regd_shm_offset(first), Some(0x100));
+        assert_eq!(contexts.get_regd_shm_offset(second), Some(0x200));
     }
 
     #[test]
     fn transitions_a_stable_context_id() {
         let contexts = RpcContextMap::new();
-        let context_id = contexts.allocate(RpcStage::LoadTaSize).unwrap();
+        let context_id = contexts.allocate(RpcStage::LoadTaSize, 0).unwrap();
 
         assert_eq!(
             contexts.transition(context_id, RpcStage::LoadTaSize, RpcStage::ShmAlloc),
@@ -170,7 +205,7 @@ mod tests {
     #[test]
     fn taking_a_context_rejects_replay() {
         let contexts = RpcContextMap::new();
-        let context_id = contexts.allocate(RpcStage::ShmFree).unwrap();
+        let context_id = contexts.allocate(RpcStage::ShmFree, 0).unwrap();
 
         assert_eq!(contexts.take(context_id), Some(RpcStage::ShmFree));
         assert_eq!(contexts.take(context_id), None);
@@ -186,7 +221,7 @@ mod tests {
             Err(RpcContextError::AlreadyExists)
         );
         assert_eq!(
-            contexts.allocate(RpcStage::LoadTaSize),
+            contexts.allocate(RpcStage::LoadTaSize, 0),
             Err(RpcContextError::Full)
         );
     }
@@ -196,7 +231,7 @@ mod tests {
         let contexts = RpcContextMap::with_limits(u32::MAX, 3);
         contexts.insert(u32::MAX, RpcStage::LoadTaSize).unwrap();
 
-        let context_id = contexts.allocate(RpcStage::ShmAlloc).unwrap();
+        let context_id = contexts.allocate(RpcStage::ShmAlloc, 0).unwrap();
         assert_eq!(context_id, 0);
         assert_eq!(
             contexts.get_curr_stage(u32::MAX),

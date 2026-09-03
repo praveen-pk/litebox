@@ -2377,14 +2377,14 @@ impl OpteeSmcArgs {
         }
     }
 
-    /// Set the context ID used to identify an RPC call in the preserved `args[4]` register.
+    /// Set the context ID used to identify an RPC call in the preserved `args[3]` register.
     pub fn set_rpc_context_id(&mut self, context_id: u32) {
-        self.args[4] = context_id as usize;
+        self.args[3] = context_id as usize;
     }
 
-    /// Get the context ID used to identify an RPC call from the preserved `args[4]` register.
+    /// Get the context ID used to identify an RPC call from the preserved `args[3]` register.
     pub fn get_rpc_context_id(&self) -> Result<u32, OpteeSmcReturnCode> {
-        self.args[4]
+        self.args[3]
             .try_into()
             .map_err(|_| OpteeSmcReturnCode::EBadCmd)
     }
@@ -2684,7 +2684,7 @@ mod tests {
     #[test]
     fn test_rpc_context_id_rejects_upper_bits() {
         let mut args = OpteeSmcArgs::default();
-        args.args[4] = (u32::MAX as usize) + 1;
+        args.args[3] = (u32::MAX as usize) + 1;
         assert_eq!(args.get_rpc_context_id(), Err(OpteeSmcReturnCode::EBadCmd));
     }
 
