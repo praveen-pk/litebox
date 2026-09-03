@@ -2251,6 +2251,28 @@ pub fn prepare_shm_alloc_rpc(
     Ok(())
 }
 
+/// Prepare a shared-memory free RPC request to be sent to normal world.
+pub fn prepare_shm_free_rpc(
+    rpc_msg_args: &mut OpteeRpcArgs,
+    shm_type: OpteeRpcShmType,
+    shm_ref: u64,
+) -> Result<(), OpteeSmcReturnCode> {
+    rpc_msg_args.cmd = OpteeRpcCommand::ShmFree;
+    rpc_msg_args.num_params = 1;
+
+    rpc_msg_args.set_param_attr_type(0, OpteeMsgAttrType::ValueInput)?;
+    rpc_msg_args.set_param_value(
+        0,
+        OpteeMsgParamValue {
+            a: shm_type as u64,
+            b: shm_ref,
+            c: 0,
+        },
+    )?;
+
+    Ok(())
+}
+
 /// Prepare a LOAD_TA RPC request to be sent to normal world.
 ///
 /// When `memref` is `None`, the request asks normal world to return the TA size.
@@ -2821,6 +2843,38 @@ mod tests {
         assert_eq!(header_out.session, 0);
         assert_eq!(header_out.cancel_id, 0);
         assert_eq!(header_out.num_params, 2);
+    }
+
+    #[test]
+    fn test_prepare_shm_free_rpc() {
+        let header = OpteeMsgArgsHeader {
+            cmd: OpteeRpcCommand::LoadTa as u32,
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: 0,
+            ret_origin: 0,
+            num_params: 1,
+        };
+        let raw_params = [0u8; size_of::<OpteeMsgParam>()];
+        let mut rpc_args = OpteeRpcArgs::from_header_and_raw_params(&header, &raw_params)
+            .expect("should parse RPC args");
+        let shm_ref = 0x2122_2324_2526_2728;
+
+        prepare_shm_free_rpc(&mut rpc_args, OpteeRpcShmType::Appl, shm_ref)
+            .expect("should prepare SHM_FREE RPC");
+
+        assert_eq!(rpc_args.cmd, OpteeRpcCommand::ShmFree);
+        assert_eq!(rpc_args.num_params, 1);
+        assert_eq!(
+            rpc_args.params[0].attr.attr_type(),
+            OpteeMsgAttrType::ValueInput as u8
+        );
+        let value = rpc_args.get_param_value(0).unwrap();
+        assert_eq!(value.a, OpteeRpcShmType::Appl as u64);
+        assert_eq!(value.b, shm_ref);
+        assert_eq!(value.c, 0);
     }
 
     #[test]

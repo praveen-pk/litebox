@@ -264,6 +264,15 @@ pub fn register_to_shm(tmem_param: &OpteeMsgParamTmem) -> Result<u64, OpteeSmcRe
     )?;
     Ok(page_offset)
 }
+
+/// Remove Litebox's local record of shared memory allocated through an RPC.
+pub fn unregister_rpc_allocated_shm(shm_ref: u64) -> Result<(), OpteeSmcReturnCode> {
+    shm_ref_map()
+        .remove(shm_ref)
+        .map(|_| ())
+        .ok_or(OpteeSmcReturnCode::EBadAddr)
+}
+
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
 /// It returns an `OpteeSmcResult` representing the result of the SMC call or `OpteeMsgArgs` it contains
 /// if the SMC call involves with an OP-TEE message which should be handled by
