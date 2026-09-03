@@ -764,7 +764,7 @@ impl TaFlags {
     /// Note: This flag is only meaningful when `SINGLE_INSTANCE` is also set.
     /// For non-single-instance TAs, instances are always destroyed when their session closes.
     pub fn is_keep_alive(&self) -> bool {
-        self.contains(TaFlags::INSTANCE_KEEP_ALIVE)
+        self.is_single_instance() && self.contains(TaFlags::INSTANCE_KEEP_ALIVE)
     }
 }
 
