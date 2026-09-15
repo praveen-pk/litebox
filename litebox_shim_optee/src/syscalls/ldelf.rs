@@ -252,10 +252,8 @@ impl Task {
             "sys_open_bin"
         );
 
-        if !self.global.contains_ta_bin(&ta_uuid) {
-            return Err(TeeResult::ItemNotFound);
-        }
-        let new_handle = self.ta_handle_map.insert(ta_uuid);
+        let ta_bin = self.get_ta_bin(&ta_uuid).ok_or(TeeResult::ItemNotFound)?;
+        let new_handle = self.ta_handle_map.insert(ta_bin);
         let _ = handle.write_at_offset(0, new_handle);
 
         Ok(())
@@ -359,10 +357,7 @@ impl Task {
                 && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
                 && self.ta_trampoline_page_range.get().is_none()
             {
-                let ta_uuid = self
-                    .ta_handle_map
-                    .get(handle)
-                    .ok_or(TeeResult::BadParameters)?;
+                let ta_uuid = self.ta_app_id;
                 // Fail here rather than let `ldelf` allocate over the
                 // trampoline and report something unrelated later.
                 crate::loader::elf::ElfLoader::ta_trampoline_relative_page_range(self, &ta_uuid)
@@ -533,9 +528,7 @@ impl Task {
         offset: usize,
         count: usize,
     ) -> Option<()> {
-        if let Some(ta_uuid) = self.ta_handle_map.get(handle)
-            && let Some(ta_bin) = self.global.get_ta_bin(&ta_uuid)
-        {
+        if let Some(ta_bin) = self.ta_handle_map.get(handle) {
             let end_offset = offset.checked_add(count)?;
             if end_offset <= ta_bin.len() {
                 dst.copy_from_slice(0, &ta_bin[offset..end_offset])

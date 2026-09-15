@@ -932,7 +932,41 @@ impl SessionManager {
     where
         F: for<'a> FnOnce(OpenSessionTarget<'a>) -> Result<(), OpteeSmcReturnCode>,
     {
-        let mut token = self.try_acquire_for_open(*uuid)?;
+        self.with_ta_inner(uuid, false, f)
+    }
+
+    /// Resume an OpenSession operation that already owns a capacity reservation.
+    pub fn with_reserved_ta<F>(&self, uuid: &TeeUuid, f: F) -> Result<(), OpteeSmcReturnCode>
+    where
+        F: for<'a> FnOnce(OpenSessionTarget<'a>) -> Result<(), OpteeSmcReturnCode>,
+    {
+        self.with_ta_inner(uuid, true, f)
+    }
+
+    /// Release the capacity reservation owned by an abandoned OpenSession RPC.
+    pub fn release_open_session_reservation(&self) {
+        let mut pending = self.pending_count.lock();
+        *pending = pending.saturating_sub(1);
+    }
+
+    fn with_ta_inner<F>(
+        &self,
+        uuid: &TeeUuid,
+        has_reservation: bool,
+        f: F,
+    ) -> Result<(), OpteeSmcReturnCode>
+    where
+        F: for<'a> FnOnce(OpenSessionTarget<'a>) -> Result<(), OpteeSmcReturnCode>,
+    {
+        let mut token = match self.try_acquire_for_open(*uuid) {
+            Ok(token) => token,
+            Err(error) => {
+                if has_reservation {
+                    self.release_open_session_reservation();
+                }
+                return Err(error);
+            }
+        };
         // Captured before `f` runs so we know whether to perform the
         // load-lock→per-UUID adoption step after successful registration.
         let on_ta_load_path = matches!(token.uuid_lock, Some(HeldUuidLock::TaLoad));
@@ -953,10 +987,14 @@ impl SessionManager {
                 } else {
                     OpenSessionTarget::Sibling(&existing)
                 };
-            return f(target);
+            let result = f(target);
+            if has_reservation {
+                self.release_open_session_reservation();
+            }
+            return result;
         }
 
-        {
+        if !has_reservation {
             let mut pending = self.pending_count.lock();
             // Capacity check including in-flight creations.
             if self.instance_count() + *pending >= MAX_TA_INSTANCES {
@@ -967,9 +1005,8 @@ impl SessionManager {
 
         let result = f(OpenSessionTarget::NewInstance);
 
-        {
-            let mut pending = self.pending_count.lock();
-            *pending = pending.saturating_sub(1);
+        if result != Err(OpteeSmcReturnCode::RpcCmd) {
+            self.release_open_session_reservation();
         }
 
         // Complete the load-lock→per-UUID transition (see
@@ -1159,6 +1196,21 @@ mod tests {
         // Cache-hit path doesn't touch pending_count.
         register_for_test(&manager, 302, single_instance_flags(), 81, uuid_single);
         manager.with_ta(&uuid_single, |_| Ok(())).unwrap();
+        assert_eq!(*manager.pending_count.lock(), 0);
+    }
+
+    #[test]
+    fn pending_count_survives_rpc_until_reserved_resume() {
+        let manager = SessionManager::new();
+        let uuid = make_uuid(9);
+
+        assert_eq!(
+            manager.with_ta(&uuid, |_| Err(OpteeSmcReturnCode::RpcCmd)),
+            Err(OpteeSmcReturnCode::RpcCmd)
+        );
+        assert_eq!(*manager.pending_count.lock(), 1);
+
+        assert_eq!(manager.with_reserved_ta(&uuid, |_| Ok(())), Ok(()));
         assert_eq!(*manager.pending_count.lock(), 0);
     }
 

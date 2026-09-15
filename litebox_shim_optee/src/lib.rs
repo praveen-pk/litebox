@@ -244,12 +244,32 @@ impl OpteeShim {
         ldelf_bin: &[u8],
         ta_uuid: TeeUuid,
     ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
+        self.load_ldelf_impl(ldelf_bin, ta_uuid, None)
+    }
+
+    /// Load `ldelf` with a request-owned Dynamic TA binary.
+    pub fn load_ldelf_with_ta_bin(
+        &self,
+        ldelf_bin: &[u8],
+        ta_uuid: TeeUuid,
+        ta_bin: Arc<[u8]>,
+    ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
+        self.load_ldelf_impl(ldelf_bin, ta_uuid, Some(ta_bin))
+    }
+
+    fn load_ldelf_impl(
+        &self,
+        ldelf_bin: &[u8],
+        ta_uuid: TeeUuid,
+        ta_bin: Option<Arc<[u8]>>,
+    ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
                 thread: ThreadState::new(),
                 ta_app_id: ta_uuid,
+                dynamic_ta_bin: ta_bin,
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
@@ -276,8 +296,7 @@ impl OpteeShim {
         } else {
             None
         };
-        // Get TA flags from the stored binary
-        let ta_flags = entrypoints.task.global.get_ta_flags(&ta_uuid);
+        let ta_flags = entrypoints.task.get_ta_flags(&ta_uuid);
         Ok(LoadedProgram {
             entrypoints: Some(entrypoints),
             params_address,
@@ -817,7 +836,6 @@ impl Task {
     ) -> Result<ThreadInitState, ElfLoaderError> {
         if !self.ta_prepared.get() {
             let ta_bin = self
-                .global
                 .get_ta_bin(&self.ta_app_id)
                 .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
             let ta_entry_point = self.get_ta_entry_point();
@@ -1305,9 +1323,9 @@ impl TeeCrypStateMap {
     }
 }
 
-/// Data structure to maintain a mapping from handles to their TA UUIDs.
+/// Data structure mapping open binary handles to pinned TA binaries.
 pub(crate) struct TaHandleMap {
-    inner: spin::mutex::SpinMutex<HashMap<u32, TeeUuid>>,
+    inner: spin::mutex::SpinMutex<HashMap<u32, Arc<[u8]>>>,
     next_handle: core::sync::atomic::AtomicU32,
 }
 
@@ -1319,20 +1337,20 @@ impl TaHandleMap {
         }
     }
 
-    pub(crate) fn insert(&self, uuid: TeeUuid) -> u32 {
+    pub(crate) fn insert(&self, ta_bin: Arc<[u8]>) -> u32 {
         let handle = self
             .next_handle
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         let mut inner = self.inner.lock();
-        inner.insert(handle, uuid);
+        inner.insert(handle, ta_bin);
         handle
     }
 
-    pub(crate) fn get(&self, handle: u32) -> Option<TeeUuid> {
-        self.inner.lock().get(&handle).copied()
+    pub(crate) fn get(&self, handle: u32) -> Option<Arc<[u8]>> {
+        self.inner.lock().get(&handle).cloned()
     }
 
-    pub(crate) fn remove(&self, handle: u32) -> Option<TeeUuid> {
+    pub(crate) fn remove(&self, handle: u32) -> Option<Arc<[u8]>> {
         self.inner.lock().remove(&handle)
     }
 }
@@ -1411,6 +1429,8 @@ struct Task {
     thread: ThreadState,
     /// TA UUID
     ta_app_id: TeeUuid,
+    /// Request-owned Dynamic TA binary; embedded TAs use the global registry.
+    dynamic_ta_bin: Option<Arc<[u8]>>,
     /// TEE cryptography state map
     tee_cryp_state_map: TeeCrypStateMap,
     /// TEE object map
@@ -1431,6 +1451,24 @@ struct Task {
     #[cfg(target_arch = "x86_64")]
     tls_base_addr: Cell<usize>,
     // TODO: OP-TEE supports global, persistent objects across sessions. Add these maps if needed.
+}
+
+impl Task {
+    fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
+        if *ta_uuid == self.ta_app_id
+            && let Some(ta_bin) = &self.dynamic_ta_bin
+        {
+            Some(ta_bin.clone())
+        } else {
+            self.global.get_ta_bin(ta_uuid)
+        }
+    }
+
+    fn get_ta_flags(&self, ta_uuid: &TeeUuid) -> TaFlags {
+        self.get_ta_bin(ta_uuid)
+            .and_then(|ta_bin| litebox_common_optee::parse_ta_head(&ta_bin))
+            .map_or_else(|| self.global.get_ta_flags(ta_uuid), |head| head.flags)
+    }
 }
 
 struct ThreadState {
@@ -1588,6 +1626,7 @@ mod test_utils {
                 global: self.clone(),
                 thread: ThreadState::new(),
                 ta_app_id: TeeUuid::default(),
+                dynamic_ta_bin: None,
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),

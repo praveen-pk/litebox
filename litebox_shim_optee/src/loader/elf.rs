@@ -235,7 +235,6 @@ impl<'a> ElfLoader<'a> {
         ta_uuid: &TeeUuid,
     ) -> Result<Option<core::ops::Range<usize>>, ElfLoaderError> {
         let ta_bin = task
-            .global
             .get_ta_bin(ta_uuid)
             .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
         // Constructing the loader only parses headers; it maps nothing.

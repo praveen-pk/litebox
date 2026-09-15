@@ -5,7 +5,7 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, vec};
+use alloc::{boxed::Box, sync::Arc, vec};
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
     mm::linux::PAGE_SIZE,
@@ -566,9 +566,13 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
             let mut msg_args = *msg_args;
             debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
             let result = match msg_args.cmd {
-                OpenSession => {
-                    handle_open_session(&mut msg_args, &mut rpc_args, msg_args_phys_addr)
-                }
+                OpenSession => handle_open_session(
+                    &mut msg_args,
+                    &mut rpc_args,
+                    msg_args_phys_addr,
+                    None,
+                    false,
+                ),
                 InvokeCommand => handle_invoke_command(&mut msg_args, msg_args_phys_addr),
                 CloseSession => handle_close_session(&mut msg_args, msg_args_phys_addr),
                 _ => {
@@ -595,10 +599,12 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                     // CallWithArg is not supported for Dynamic TA RPC continuation.
                     // This applies to how shm_ref is interpreted and used during RPC calls.
                     if smc_args.func_id() != Ok(OpteeSmcFunction::CallWithRegdArg) {
+                        session_manager().release_open_session_reservation();
                         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                         return *smc_args;
                     }
                     let Some(rpc_args_ref) = rpc_args.as_ref() else {
+                        session_manager().release_open_session_reservation();
                         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                         return *smc_args;
                     };
@@ -608,6 +614,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                         match smc_args.optee_regd_shm_ref_and_offset() {
                             Ok(location) => location,
                             Err(error) => {
+                                session_manager().release_open_session_reservation();
                                 smc_args.set_return_code(error);
                                 return *smc_args;
                             }
@@ -618,6 +625,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                     {
                         Some(ta_uuid) => ta_uuid,
                         None => {
+                            session_manager().release_open_session_reservation();
                             smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                             return *smc_args;
                         }
@@ -630,6 +638,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                     ) {
                         Ok(context_id) => context_id,
                         Err(error) => {
+                            session_manager().release_open_session_reservation();
                             debug_serial_println!(
                                 "Failed to allocate RPC context for LOAD_TA request: {:?}",
                                 error
@@ -645,7 +654,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
                         msg_args.num_params,
                         rpc_args_ref,
                     ) {
-                        let _ = rpc_context_map().take(context_id);
+                        discard_rpc_context(context_id);
                         smc_args.set_return_code(e);
                     } else {
                         smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
@@ -805,20 +814,10 @@ fn handle_return_from_load_ta_binary_rpc(
 
     let completion = match response {
         Ok(ta_binary) => {
-            let Some(ta_uuid) = rpc_context_map().get_ta_uuid(context_id) else {
-                start_shm_free_rpc(
-                    smc_args,
-                    msg_args,
-                    rpc_args,
-                    context_id,
-                    RpcStage::LoadTaBinary,
-                    shm_ref,
-                    RpcCompletion::ReturnError(OpteeSmcReturnCode::EBadCmd),
-                );
-                return;
-            };
-            let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
-            if !shim.store_ta_bin(&ta_uuid, &ta_binary) {
+            if rpc_context_map()
+                .set_ta_binary(context_id, RpcStage::LoadTaBinary, Arc::from(ta_binary))
+                .is_err()
+            {
                 RpcCompletion::ReturnError(OpteeSmcReturnCode::EBadCmd)
             } else {
                 RpcCompletion::OpenSession
@@ -826,8 +825,7 @@ fn handle_return_from_load_ta_binary_rpc(
         }
         Err(error) => RpcCompletion::ReturnError(error),
     };
-    let ta_uuid = rpc_context_map().get_ta_uuid(context_id);
-    if !start_shm_free_rpc(
+    start_shm_free_rpc(
         smc_args,
         msg_args,
         rpc_args,
@@ -835,13 +833,7 @@ fn handle_return_from_load_ta_binary_rpc(
         RpcStage::LoadTaBinary,
         shm_ref,
         completion,
-    ) && completion == RpcCompletion::OpenSession
-        && let Some(ta_uuid) = ta_uuid
-    {
-        litebox_shim_optee::OpteeShimBuilder::new()
-            .build()
-            .remove_ta_bin(&ta_uuid);
-    }
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -894,32 +886,39 @@ fn handle_return_from_shm_free_rpc(
         return;
     };
     if context.stage() != RpcStage::ShmFree {
+        session_manager().release_open_session_reservation();
         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
         return;
     }
     match context.completion() {
         RpcCompletion::OpenSession => {
-            let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
             if rpc_args.cmd != OpteeRpcCommand::ShmFree
                 || rpc_args.ret != TeeResult::Success
                 || rpc_args.num_params != 1
             {
-                shim.remove_ta_bin(&context.ta_uuid());
+                session_manager().release_open_session_reservation();
                 smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                 return;
             }
+            let Some(ta_binary) = context.into_ta_binary() else {
+                session_manager().release_open_session_reservation();
+                smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                return;
+            };
             let mut no_rpc_args = None;
-            let result = handle_open_session(msg_args, &mut no_rpc_args, msg_args_phys_addr);
-            // Regardless of the result, remove the TA binary from VTL1 cache.
-            // If the TA is SINGLE_INSTANCE and has KEEP_ALIVE flag, the TA
-            // runtime will be cached in memory even after last session is
-            // closed.
-            shim.remove_ta_bin(&context.ta_uuid());
+            let result = handle_open_session(
+                msg_args,
+                &mut no_rpc_args,
+                msg_args_phys_addr,
+                Some(ta_binary),
+                true,
+            );
             smc_args.set_return_code(result.err().unwrap_or(OpteeSmcReturnCode::Ok));
         }
-        // ReturnError is only recorded before the TA binary is cached or when
-        // caching fails. Removing by UUID here could evict another load's entry.
-        RpcCompletion::ReturnError(error) => smc_args.set_return_code(error),
+        RpcCompletion::ReturnError(error) => {
+            session_manager().release_open_session_reservation();
+            smc_args.set_return_code(error);
+        }
     }
 }
 
@@ -1110,11 +1109,13 @@ fn write_next_rpc(
 }
 
 fn discard_rpc_context(context_id: u32) {
-    if let Some(context) = rpc_context_map().take(context_id)
-        && context.local_shm_registered()
-        && let Some(shm_ref) = context.shm_ref()
-    {
-        let _ = unregister_rpc_shm(shm_ref);
+    if let Some(context) = rpc_context_map().take(context_id) {
+        session_manager().release_open_session_reservation();
+        if context.local_shm_registered()
+            && let Some(shm_ref) = context.shm_ref()
+        {
+            let _ = unregister_rpc_shm(shm_ref);
+        }
     }
 }
 
@@ -1131,17 +1132,77 @@ fn handle_open_session(
     msg_args: &mut OpteeMsgArgs,
     rpc_args: &mut Option<Box<OpteeRpcArgs>>,
     msg_args_phys_addr: u64,
+    dynamic_ta_bin: Option<Arc<[u8]>>,
+    has_capacity_reservation: bool,
 ) -> Result<(), OpteeSmcReturnCode> {
-    let ta_req_info = decode_ta_request(msg_args).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+    let release_unused_reservation = || {
+        if has_capacity_reservation {
+            session_manager().release_open_session_reservation();
+        }
+    };
+    let ta_req_info = match decode_ta_request(msg_args) {
+        Ok(ta_req_info) => ta_req_info,
+        Err(_) => {
+            release_unused_reservation();
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+    };
     if ta_req_info.entry_func != UteeEntryFunc::OpenSession {
+        release_unused_reservation();
         return Err(OpteeSmcReturnCode::EBadCmd);
     }
 
-    let ta_uuid = ta_req_info.uuid.ok_or(OpteeSmcReturnCode::EBadCmd)?;
+    let Some(ta_uuid) = ta_req_info.uuid else {
+        release_unused_reservation();
+        return Err(OpteeSmcReturnCode::EBadCmd);
+    };
     let client_identity = ta_req_info.client_identity;
     let params = &ta_req_info.params;
 
-    session_manager().with_ta(&ta_uuid, |target| match target {
+    if has_capacity_reservation {
+        session_manager().with_reserved_ta(&ta_uuid, |target| {
+            handle_open_session_target(
+                target,
+                msg_args,
+                rpc_args,
+                msg_args_phys_addr,
+                params,
+                ta_uuid,
+                client_identity,
+                &ta_req_info,
+                dynamic_ta_bin,
+            )
+        })
+    } else {
+        session_manager().with_ta(&ta_uuid, |target| {
+            handle_open_session_target(
+                target,
+                msg_args,
+                rpc_args,
+                msg_args_phys_addr,
+                params,
+                ta_uuid,
+                client_identity,
+                &ta_req_info,
+                dynamic_ta_bin,
+            )
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_open_session_target(
+    target: OpenSessionTarget<'_>,
+    msg_args: &mut OpteeMsgArgs,
+    rpc_args: &mut Option<Box<OpteeRpcArgs>>,
+    msg_args_phys_addr: u64,
+    params: &[litebox_common_optee::UteeParamOwned],
+    ta_uuid: litebox_common_optee::TeeUuid,
+    client_identity: Option<litebox_common_optee::TeeIdentity>,
+    ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
+    dynamic_ta_bin: Option<Arc<[u8]>>,
+) -> Result<(), OpteeSmcReturnCode> {
+    match target {
         OpenSessionTarget::Sibling(instance) => open_session_single_instance(
             msg_args,
             msg_args_phys_addr,
@@ -1158,6 +1219,7 @@ fn handle_open_session(
             ta_uuid,
             client_identity,
             &ta_req_info,
+            dynamic_ta_bin,
         ),
         OpenSessionTarget::Busy => {
             // Single-instance TA without MULTI_SESSION already has a live
@@ -1168,7 +1230,7 @@ fn handle_open_session(
             write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
             Ok(())
         }
-    })
+    }
 }
 
 /// Open a new session on an existing single-instance TA.
@@ -1348,10 +1410,11 @@ fn open_session_new_instance(
     ta_uuid: litebox_common_optee::TeeUuid,
     client_identity: Option<litebox_common_optee::TeeIdentity>,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
+    dynamic_ta_bin: Option<Arc<[u8]>>,
 ) -> Result<(), OpteeSmcReturnCode> {
     let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
 
-    if !shim.contains_ta_bin(&ta_uuid) {
+    if dynamic_ta_bin.is_none() && !shim.contains_ta_bin(&ta_uuid) {
         debug_serial_println!(
             "TA binary not found for uuid={:?}, requesting load from normal world",
             ta_uuid
@@ -1388,12 +1451,18 @@ fn open_session_new_instance(
     })?;
 
     // Load ldelf and TA - Box immediately to keep at fixed heap address
-    let loaded_program = Box::new(shim.load_ldelf(LDELF_BINARY, ta_uuid).map_err(|_| {
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
-        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
-        OpteeSmcReturnCode::ENomem
-    })?);
+    let loaded_program = Box::new(
+        match dynamic_ta_bin {
+            Some(ta_bin) => shim.load_ldelf_with_ta_bin(LDELF_BINARY, ta_uuid, ta_bin),
+            None => shim.load_ldelf(LDELF_BINARY, ta_uuid),
+        }
+        .map_err(|_| {
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
+            unsafe { teardown_ta_page_table(&shim, task_pt_id) };
+            OpteeSmcReturnCode::ENomem
+        })?,
+    );
 
     let ta_flags = loaded_program.ta_flags;
 

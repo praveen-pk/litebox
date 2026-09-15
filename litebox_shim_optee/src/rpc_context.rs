@@ -65,7 +65,7 @@
 //! memory and tracks the subsequent `SHM_FREE` round trip explicitly with
 //! [`RpcStage::ShmFree`].
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicU32, Ordering};
 use hashbrown::HashMap;
 use litebox_common_optee::{OpteeSmcReturnCode, TeeUuid};
@@ -101,7 +101,7 @@ pub enum RpcCompletion {
 }
 
 /// Trusted state for an RPC-backed Dynamic TA request.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RpcContext {
     stage: RpcStage,
     ta_uuid: TeeUuid,
@@ -112,6 +112,8 @@ pub struct RpcContext {
     shm_ref: Option<u64>,
     /// Whether this context owns an entry for the allocation in the local SHM map.
     local_shm_registered: bool,
+    /// Dynamic TA binary owned by this request until OpenSession resumes.
+    ta_binary: Option<Arc<[u8]>>,
     completion: RpcCompletion,
 }
 
@@ -130,6 +132,7 @@ impl RpcContext {
             requested_size: None,
             shm_ref: None,
             local_shm_registered: false,
+            ta_binary: None,
             completion: RpcCompletion::OpenSession,
         }
     }
@@ -162,6 +165,11 @@ impl RpcContext {
     /// Return whether this context inserted its allocation into the local SHM map.
     pub fn local_shm_registered(&self) -> bool {
         self.local_shm_registered
+    }
+
+    /// Consume the dynamic TA binary associated with this request.
+    pub fn into_ta_binary(self) -> Option<Arc<[u8]>> {
+        self.ta_binary
     }
 
     /// Return the action to perform when this RPC sequence finishes.
@@ -346,6 +354,24 @@ impl RpcContextMap {
             .lock()
             .get(&context_id)
             .map(RpcContext::local_shm_registered)
+    }
+
+    /// Store a dynamic TA binary while awaiting shared-memory cleanup.
+    pub fn set_ta_binary(
+        &self,
+        context_id: u32,
+        expected_stage: RpcStage,
+        ta_binary: Arc<[u8]>,
+    ) -> Result<(), RpcContextError> {
+        let mut contexts = self.inner.lock();
+        let context = contexts
+            .get_mut(&context_id)
+            .ok_or(RpcContextError::NotFound)?;
+        if context.stage != expected_stage {
+            return Err(RpcContextError::UnexpectedStage);
+        }
+        context.ta_binary = Some(ta_binary);
+        Ok(())
     }
 
     /// Set the action to perform after the current RPC sequence is cleaned up.
@@ -556,6 +582,31 @@ mod tests {
         assert_eq!(
             contexts.take(context_id).unwrap().completion(),
             RpcCompletion::ReturnError(OpteeSmcReturnCode::EBadCmd)
+        );
+    }
+
+    #[test]
+    fn owns_dynamic_ta_binary_until_context_is_taken() {
+        let contexts = RpcContextMap::new();
+        let context_id = contexts
+            .allocate(RpcStage::LoadTaBinary, test_uuid(1), 1, 0)
+            .unwrap();
+        let ta_binary: Arc<[u8]> = Arc::from([1, 2, 3]);
+
+        assert_eq!(
+            contexts.set_ta_binary(context_id, RpcStage::LoadTaBinary, ta_binary.clone(),),
+            Ok(())
+        );
+        assert_eq!(
+            contexts.set_ta_binary(context_id, RpcStage::ShmFree, ta_binary),
+            Err(RpcContextError::UnexpectedStage)
+        );
+        assert_eq!(
+            contexts
+                .take(context_id)
+                .and_then(RpcContext::into_ta_binary)
+                .as_deref(),
+            Some([1, 2, 3].as_slice())
         );
     }
 
